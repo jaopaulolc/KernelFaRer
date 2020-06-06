@@ -1,0 +1,165 @@
+//===- GEMMFaRer.h - Matrix-Multiply Replacer Pass --------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This pass implements an idiom recognizer that transforms matrix-multiply
+// loops into a call to llvm.matrix.multiply.* intrinsic. In cases that this
+// kicks in, it can be a significant performance win.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_TRANSFORMS_SCALAR_GEMMFARER_H
+#define LLVM_TRANSFORMS_SCALAR_GEMMFARER_H
+
+#include "llvm/ADT/SetVector.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/Value.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+namespace GEMMFaRer {
+
+/// Matrix memory layout
+enum MatrixLayout { RowMajor, ColMajor };
+
+/// Class that represents a matrix extracted from GEMM
+class Matrix {
+  Value &BaseAddressPointer;   ///< pointer to the array of matrix elements
+  MatrixLayout Layout;         ///< layout of matrix elements in the array
+  Value &LeadingDimensionSize; ///< number of elements between two consecutive
+                               ///< columns if ColMajor or consecutive rows if
+                               ///< RowMajor
+  Value &Rows;                 ///< number of Rows
+  Value &Columns;              ///< number of Columns
+  Value &RowIV;                ///< induction variable to access rows
+  Value &ColumnIV;             ///< induction variable to access columns
+
+public:
+  Matrix(Value &BaseAddressPointer, MatrixLayout Layout,
+         Value &LeadingDimensionSize, Value &Rows, Value &Columns, Value &RowIV,
+         Value &ColumnIV)
+      : BaseAddressPointer(BaseAddressPointer), Layout(Layout),
+        LeadingDimensionSize(LeadingDimensionSize), Rows(Rows),
+        Columns(Columns), RowIV(RowIV), ColumnIV(ColumnIV) {}
+
+  Value &getBaseAddressPointer() const { return BaseAddressPointer; }
+  MatrixLayout getLayout() const { return Layout; }
+  Value &getLeadingDimensionSize() const { return LeadingDimensionSize; }
+  Value &getRows() const { return Rows; }
+  Value &getColumns() const { return Columns; }
+  Value &getRowIV() const { return RowIV; }
+  Value &getColumnIV() const { return ColumnIV; }
+}; // class Matrix
+
+/// Class that represents a triple-nested loop that computes a general
+/// matrix-matrix multiply.
+class GEMM {
+  Loop &L;
+  Instruction &ReductionStore;
+  Matrix MatrixA;
+  Matrix MatrixB;
+  Matrix MatrixC;
+  Value *Alpha;
+  Value *Beta;
+  SmallSetVector<const Value *, 2> Stores;
+
+public:
+  GEMM(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
+       Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
+       Value *Alpha = nullptr, Value *Beta = nullptr)
+      : L(L), ReductionStore(RS), MatrixA(std::move(MatrixA)),
+        MatrixB(std::move(MatrixB)), MatrixC(std::move(MatrixC)), Alpha(Alpha),
+        Beta(Beta), Stores(std::move(Stores)) {}
+
+  Loop &getAssociatedLoop() const { return L; }
+
+  Instruction &getReductionStore() const { return ReductionStore; }
+
+  const Matrix &getMatrixA() const { return MatrixA; }
+
+  const Matrix &getMatrixB() const { return MatrixB; }
+
+  const Matrix &getMatrixC() const { return MatrixC; }
+
+  Value *getAlpha() const { return Alpha; }
+
+  Value *getBeta() const { return Beta; }
+
+  /// This predicate method determines if \p Store is a store to GEMM's result
+  /// matrix.
+  ///
+  /// \param Store a StoreInst to be checked if it a store to GEMM's result
+  /// matrix.
+  ///
+  /// \returns true if \p Store store into GEMM's result matrix and false
+  /// otherwise.
+  bool isGemmStore(const Value &Store) const {
+    return Stores.count(&Store) != 0;
+  }
+
+  /// This predicate method determines if \p V is one of the values used to
+  /// compute this GEMM.
+  ///
+  /// \param V a value to be checked if it is used to compute GEMM
+  ///
+  /// \returns true if \p V is used to compute GEMM and false otherwise.
+  bool isGemmValue(const Value &V) const {
+
+    auto &M = MatrixA.getRows();
+    auto &K = MatrixA.getColumns();
+    auto &N = MatrixB.getColumns();
+
+    auto &IndVarI = MatrixA.getRowIV();
+    auto &IndVarK = MatrixA.getColumnIV();
+    auto &IndVarJ = MatrixB.getColumnIV();
+
+    auto &ABaseAddr = MatrixA.getBaseAddressPointer();
+    auto &BBaseAddr = MatrixB.getBaseAddressPointer();
+    auto &CBaseAddr = MatrixC.getBaseAddressPointer();
+
+    auto &LDA = MatrixA.getLeadingDimensionSize();
+    auto &LDB = MatrixB.getLeadingDimensionSize();
+    auto &LDC = MatrixC.getLeadingDimensionSize();
+
+    return (&V == Alpha || &V == Beta || &V == &IndVarI || &V == &IndVarJ ||
+            &V == &IndVarK || &V == &M || &V == &N || &V == &K ||
+            &V == &ABaseAddr || &V == &BBaseAddr || &V == &CBaseAddr ||
+            &V == &LDA || &V == &LDB || &V == &LDC);
+  }
+}; // class GEMM
+
+/// Performs Matrix-Multiply Recognition Pass.
+struct GEMMMatcher {
+public:
+  using Result = std::unique_ptr<SmallVector<GEMM, 4>>;
+  static Result run(Function &F, LoopInfo &LI, DominatorTree &DT);
+};
+
+/// Checks if GEMM can be replaced with a call to llvm.matrix.multiply.*
+struct GEMMDataAnalysisPass {
+public:
+  static bool run(GEMM &GeMM);
+};
+
+} // end of namespace GEMMFaRer
+
+namespace llvm {
+/// Performs Matrix-Multiply Replacer Pass.
+struct GEMMReplacerPass : public PassInfoMixin<GEMMReplacerPass> {
+  friend PassInfoMixin<GEMMReplacerPass>;
+
+public:
+  static PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+};
+
+} // end of namespace llvm
+
+#endif /* LLVM_TRANSFORMS_SCALAR_GEMMFARER_H */

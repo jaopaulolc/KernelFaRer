@@ -83,6 +83,7 @@
 #include "llvm/Transforms/Scalar/DivRemPairs.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/Float2Int.h"
+#include "llvm/Transforms/Scalar/GEMMFaRer.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
@@ -223,6 +224,8 @@ extern cl::opt<bool> EnableMatrix;
 
 extern cl::opt<bool> DisablePreInliner;
 extern cl::opt<int> PreInlineThreshold;
+
+extern cl::opt<bool> EnableKernelReplacer;
 } // namespace llvm
 
 void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
@@ -987,6 +990,31 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
   // Synthesize function entry counts for non-PGO compilation.
   if (EnableSyntheticCounts && !PGOOpt)
     MPM.addPass(SyntheticCountsPropagation());
+
+  if (EnableKernelReplacer) {
+    MPM.addPass(createModuleToFunctionPassAdaptor(SROAPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true /* Enable mem-ssa. */)));
+    MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(ReassociatePass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,/*AllowSpeculation*/true))));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(SimpleLoopUnswitchPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopRotatePass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopInstSimplifyPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopSimplifyCFGPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(IndVarSimplifyPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(BDCEPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(GEMMReplacerPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopDeletionPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(BDCEPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    EnableMatrix = true;
+  }
 
   if (EnableModuleInliner)
     MPM.addPass(buildModuleInlinerPipeline(Level, Phase));

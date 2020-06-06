@@ -156,6 +156,7 @@
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/FlattenCFG.h"
 #include "llvm/Transforms/Scalar/Float2Int.h"
+#include "llvm/Transforms/Scalar/GEMMFaRer.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/GuardWidening.h"
 #include "llvm/Transforms/Scalar/IVUsersPrinter.h"

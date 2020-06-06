@@ -142,6 +142,10 @@ cl::opt<bool> EnableMatrix(
     "enable-matrix", cl::init(false), cl::Hidden,
     cl::desc("Enable lowering of the matrix intrinsics"));
 
+cl::opt<bool> EnableKernelReplacer(
+    "enable-kernel-replacer", cl::init(false), cl::Hidden,
+    cl::desc("Enable matrix-multiply replacer pass (implies --enable-matrix)"));
+
 cl::opt<bool> EnableConstraintElimination(
     "enable-constraint-elimination", cl::init(false), cl::Hidden,
     cl::desc(

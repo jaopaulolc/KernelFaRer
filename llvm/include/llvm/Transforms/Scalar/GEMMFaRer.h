@@ -27,13 +27,26 @@ using namespace llvm;
 
 namespace GEMMFaRer {
 
-/// Matrix memory layout
-enum MatrixLayout { RowMajor, ColMajor };
+/// Available replacement modes
+///
+/// CBLAS - matched GEMM is replaced with a call to cblas_Xgemm
+/// MatrixIntrinsics - matched GEMM is replaced with calls to llvm.matrix.*
+enum ReplacementMode : uint8_t { CBLAS, MatrixIntrinsics, UNKNOWN = 0xFF };
+
+// These constants are from
+// https://github.com/xianyi/OpenBLAS/blob/develop/cblas.h#L54-L58
+enum CBLAS_ORDER { RowMajor = 101, ColMajor = 102 };
+enum CBLAS_TRANSPOSE {
+  NoTrans = 111,
+  Trans = 112,
+  ConjTrans = 113,
+  ConjNoTrans = 114
+};
 
 /// Class that represents a matrix extracted from GEMM
 class Matrix {
   Value &BaseAddressPointer;   ///< pointer to the array of matrix elements
-  MatrixLayout Layout;         ///< layout of matrix elements in the array
+  CBLAS_ORDER Layout;          ///< layout of matrix elements in the array
   Value &LeadingDimensionSize; ///< number of elements between two consecutive
                                ///< columns if ColMajor or consecutive rows if
                                ///< RowMajor
@@ -43,7 +56,7 @@ class Matrix {
   Value &ColumnIV;             ///< induction variable to access columns
 
 public:
-  Matrix(Value &BaseAddressPointer, MatrixLayout Layout,
+  Matrix(Value &BaseAddressPointer, CBLAS_ORDER Layout,
          Value &LeadingDimensionSize, Value &Rows, Value &Columns, Value &RowIV,
          Value &ColumnIV)
       : BaseAddressPointer(BaseAddressPointer), Layout(Layout),
@@ -51,7 +64,7 @@ public:
         Columns(Columns), RowIV(RowIV), ColumnIV(ColumnIV) {}
 
   Value &getBaseAddressPointer() const { return BaseAddressPointer; }
-  MatrixLayout getLayout() const { return Layout; }
+  CBLAS_ORDER getLayout() const { return Layout; }
   Value &getLeadingDimensionSize() const { return LeadingDimensionSize; }
   Value &getRows() const { return Rows; }
   Value &getColumns() const { return Columns; }

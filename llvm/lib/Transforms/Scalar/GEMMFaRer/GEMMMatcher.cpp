@@ -440,15 +440,6 @@ static bool matchLoopUpperBound(LoopInfo &LI, PHINode *IndVar, Value *&UBound) {
               UBound = nullptr;
               return false;
             }
-            // TODO: Only static-sized MM are captured because they are
-            // directly replaced with a call to llvm.matrix.multiply.*
-            // Once the replacement is improved to generate tiled loops
-            // that call the matrix multiply intrinsic then this
-            // constraint should be removed.
-            if (!isa<ConstantInt>(UBound)) {
-              UBound = nullptr;
-              return false;
-            }
             return true;
           }
         }
@@ -489,8 +480,8 @@ static Loop *getOuterLoop(LoopInfo &LI, Value *const &I, Value *const &J,
 // false, since their respective accesses are not part of a GEMM. Otherwise,
 // this function returns true and ALayout, BLayout, and CLayout accordingly.
 bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
-                       PHINode *&C1, PHINode *&C2, MatrixLayout &ALayout,
-                       MatrixLayout &BLayout, MatrixLayout &CLayout, Value *&I,
+                       PHINode *&C1, PHINode *&C2, CBLAS_ORDER &ALayout,
+                       CBLAS_ORDER &BLayout, CBLAS_ORDER &CLayout, Value *&I,
                        Value *&J, Value *&K, LoopInfo &LI) {
   if (A1 == nullptr || A2 == nullptr || B1 == nullptr || B2 == nullptr ||
       C1 == nullptr || C2 == nullptr)
@@ -509,12 +500,12 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
     II = A2;
     JJ = B2;
     KK = A1;
-    ALayout = MatrixLayout::ColMajor;
-    BLayout = MatrixLayout::RowMajor;
+    ALayout = CBLAS_ORDER::ColMajor;
+    BLayout = CBLAS_ORDER::RowMajor;
     if (A2 == C1 && B2 == C2)
-      CLayout = MatrixLayout::RowMajor;
+      CLayout = CBLAS_ORDER::RowMajor;
     else if (A2 == C2 && B2 == C1)
-      CLayout = MatrixLayout::ColMajor;
+      CLayout = CBLAS_ORDER::ColMajor;
     else
       // Not GEMM
       Matched = false;
@@ -522,12 +513,12 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
     II = A2;
     JJ = B1;
     KK = A1;
-    ALayout = MatrixLayout::ColMajor;
-    BLayout = MatrixLayout::ColMajor;
+    ALayout = CBLAS_ORDER::ColMajor;
+    BLayout = CBLAS_ORDER::ColMajor;
     if (A2 == C1 && B1 == C2)
-      CLayout = MatrixLayout::RowMajor;
+      CLayout = CBLAS_ORDER::RowMajor;
     else if (A2 == C2 && B1 == C1)
-      CLayout = MatrixLayout::ColMajor;
+      CLayout = CBLAS_ORDER::ColMajor;
     else {
       // Not GEMM
       Matched = false;
@@ -536,12 +527,12 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
     II = A1;
     JJ = B2;
     KK = A2;
-    ALayout = MatrixLayout::RowMajor;
-    BLayout = MatrixLayout::RowMajor;
+    ALayout = CBLAS_ORDER::RowMajor;
+    BLayout = CBLAS_ORDER::RowMajor;
     if (A1 == C1 && B2 == C2)
-      CLayout = MatrixLayout::RowMajor;
+      CLayout = CBLAS_ORDER::RowMajor;
     else if (A1 == C2 && B2 == C1)
-      CLayout = MatrixLayout::ColMajor;
+      CLayout = CBLAS_ORDER::ColMajor;
     else {
       // Not GEMM
       Matched = false;
@@ -550,12 +541,12 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
     II = A1;
     JJ = B1;
     KK = A2;
-    ALayout = MatrixLayout::RowMajor;
-    BLayout = MatrixLayout::ColMajor;
+    ALayout = CBLAS_ORDER::RowMajor;
+    BLayout = CBLAS_ORDER::ColMajor;
     if (A1 == C1 && B1 == C2)
-      CLayout = MatrixLayout::RowMajor;
+      CLayout = CBLAS_ORDER::RowMajor;
     else if (A1 == C2 && B1 == C1)
-      CLayout = MatrixLayout::ColMajor;
+      CLayout = CBLAS_ORDER::ColMajor;
     else {
       // Not GEMM
       Matched = false;
@@ -588,8 +579,8 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
 static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
                       Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
                       Value *&BasePtrToC, Value *&LDA, Value *&LDB, Value *&LDC,
-                      MatrixLayout &ALayout, MatrixLayout &BLayout,
-                      MatrixLayout &CLayout, LoopInfo &LI, Value *&Alpha,
+                      CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
+                      CBLAS_ORDER &CLayout, LoopInfo &LI, Value *&Alpha,
                       Value *&Beta, bool &IsCReduced) {
   auto *SeedInstAsValue = static_cast<Value *>(&SeedInst);
   Value *Alpha1 = nullptr;
@@ -719,9 +710,9 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         Value *K = nullptr;
         Value *Alpha = nullptr;
         Value *Beta = nullptr;
-        MatrixLayout ALayout;
-        MatrixLayout BLayout;
-        MatrixLayout CLayout;
+        CBLAS_ORDER ALayout;
+        CBLAS_ORDER BLayout;
+        CBLAS_ORDER CLayout;
         bool IsCReduced = false;
         SmallSetVector<const llvm::Value *, 2> Stores;
 

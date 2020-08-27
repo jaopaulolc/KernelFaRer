@@ -31,9 +31,20 @@
 #define DEBUG_TYPE "gemm-replacer-pass"
 
 using namespace llvm;
+using namespace GEMMFaRer;
 
 // Anonymous namespace containing rewriter functions.
 namespace {
+
+// Command line argument that determines which mode we are replacing in.
+cl::opt<GEMMFaRer::ReplacementMode> ReplaceMode(
+    "gemmfarer-replacement-mode",
+    cl::desc("Available GeMM replacement methods."),
+    cl::values(clEnumValN(GEMMFaRer::MatrixIntrinsics, "matrix-intrinsics",
+                          "Replace using llvm.matrix.* intrinsics."),
+               clEnumValN(GEMMFaRer::CBLAS, "cblas-interface",
+                          "Replace using the CBLAS interface.")),
+    cl::ValueRequired, cl::init(GEMMFaRer::UNKNOWN));
 
 // A helper function that returns Matrix loaded in column-major order as a
 // flat-vector.
@@ -95,6 +106,148 @@ Type *getMatrixElementType(const Value &V) {
   return ElementType;
 }
 
+/// A helper function that Down-/uppercasts integer value to Int32
+///
+/// \param V a Value pointer to an integer type
+/// \param downcast this value is set to true if the value \p V was downcast
+///
+/// \returns the downcast value
+auto *prepBLASInt32(IRBuilder<> &IR, Value *V, bool &Downcast) {
+  if (V->getType()->getIntegerBitWidth() > 32)
+    Downcast |= true; // We're doing a potentially (but unlikely) illegal cast.
+  if (V->getType()->getIntegerBitWidth() != 32)
+    V = IR.CreateIntCast(V, IR.getInt32Ty(), false);
+  return V;
+}
+
+/// A helper function that returns a constant scalar value of 1 if it was not
+/// matched (alpha and beta implicitly equal to 1).
+///
+/// \param V a Value that points to a scalar or nullptr
+/// \param opTy the Type of the scalar pointed by \p
+///
+/// \returns \p V if it not nullptr. Otherwise, returns a constant equal to 1.
+Value *prepBLASScalar(IRBuilder<> &IR, Value *V, Type *OpTy, double Init = 1.) {
+  Value *Scalar;
+  if (OpTy->isFloatTy()) {
+    float f = Init;
+    Scalar = ConstantFP::get(OpTy, APFloat(f));
+  } else if (OpTy->isDoubleTy()) {
+    double d = Init;
+    Scalar = ConstantFP::get(OpTy, APFloat(d));
+  } else {
+    llvm_unreachable("Scalar needs to be either FloatTy or DoubleTy.");
+  }
+  return V != nullptr ? V : Scalar;
+}
+
+/// A helper function that returns the base pointer to matrix \p M. If the
+/// base pointer points to a vector of pointers it needs to be casted to a
+/// flat-pointer before it is passed to cblas_X()
+///
+/// \param IR the IR builder handling the current function
+/// transformation
+///
+/// \param M the matrix from which the base pointer will be returned
+///
+/// \returns the base pointer to matrix \p M.
+auto *getFlatPointerToMatrix(IRBuilder<> &IR, const GEMMFaRer::Matrix &M) {
+  // Flatten array
+  auto *BasePtr = &M.getBaseAddressPointer();
+  auto *DestTy = getMatrixElementType(*BasePtr)->getPointerTo();
+  BasePtr = IR.CreateBitCast(BasePtr, DestTy);
+
+  // If we have a pointer to a vector (e.g. [1024 x double]*) it is safe to
+  // convert it to a pointer to the base type. We cast away explicit size
+  // info but BLAS doesn't care.
+  if (auto *MATy = dyn_cast<ArrayType>(getMatrixElementType(*BasePtr)))
+    BasePtr = IR.CreatePointerCast(BasePtr,
+                                   MATy->getArrayElementType()->getPointerTo());
+  return BasePtr;
+}
+
+inline void insertNoInlineCall(Module &M, IRBuilder<> &IR,
+                               ArrayRef<Type *> ArgTys, ArrayRef<Value *> Args,
+                               StringRef FunctionName) {
+  // Add a declaration for the function we're going to be replacing with.
+  auto *FTy = FunctionType::get(IR.getVoidTy(), ArgTys, false);
+  FunctionCallee F = M.getOrInsertFunction(FunctionName, FTy);
+
+  // We can never inline this call.
+  cast<Function>(F.getCallee())->addFnAttr(Attribute::NoInline);
+
+  // Create the call to the function.
+  CallInst *Call = IR.CreateCall(F, Args);
+  Call->setIsNoInline();
+}
+
+void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
+                       const GEMMFaRer::GEMM &Gemm) {
+
+  const GEMMFaRer::Matrix &MA = Gemm.getMatrixA();
+  const GEMMFaRer::Matrix &MB = Gemm.getMatrixB();
+  const GEMMFaRer::Matrix &MC = Gemm.getMatrixC();
+
+  // Matrix C's layout defines cblas_X() layout bacause it cannot be trasposed.
+  ConstantInt *Layout = IR.getInt32(MC.getLayout());
+  ConstantInt *TransA =
+      IR.getInt32(MA.getLayout() == MC.getLayout() ? CBLAS_TRANSPOSE::NoTrans
+                                                   : CBLAS_TRANSPOSE::Trans);
+  ConstantInt *TransB =
+      IR.getInt32(MB.getLayout() == MC.getLayout() ? CBLAS_TRANSPOSE::NoTrans
+                                                   : CBLAS_TRANSPOSE::Trans);
+
+  // BLAS interface only supports I32 so we will warn when we downcast.
+  bool Downcast = false;
+
+  // Make args for M, N, K.
+  auto *M = prepBLASInt32(IR, &MA.getRows(), Downcast);
+  auto *K = prepBLASInt32(IR, &MA.getColumns(), Downcast);
+  auto *N = prepBLASInt32(IR, &MB.getColumns(), Downcast);
+
+  // Args for memory pointers to A, B, C
+  auto *A = getFlatPointerToMatrix(IR, MA);
+  auto *B = getFlatPointerToMatrix(IR, MB);
+  auto *C = getFlatPointerToMatrix(IR, MC);
+
+  // Make args for LDA, LDB, LDC.
+  auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
+  auto *LDB = prepBLASInt32(IR, &MB.getLeadingDimensionSize(), Downcast);
+  auto *LDC = prepBLASInt32(IR, &MC.getLeadingDimensionSize(), Downcast);
+
+  // C's pointed to type defines the operation type.
+  auto *OpTy = getMatrixElementType(*C);
+
+  // Make args for alpha/beta.
+  Value *Alpha = prepBLASScalar(IR, Gemm.getAlpha(), OpTy);
+  Value *Beta =
+      prepBLASScalar(IR, Gemm.getBeta(), OpTy, Gemm.IsCReduced() ? 1.0 : 0.0);
+
+  // Sanity type checking.
+  assert(getMatrixElementType(*A) == OpTy && "A and C are typed differently.");
+  assert(getMatrixElementType(*B) == OpTy && "B and C are typed differently.");
+  assert(Alpha->getType() == OpTy && "Alpha and C are typed differently.");
+  assert(Beta->getType() == OpTy && "Beta and C are typed differently.");
+
+  // Send out downcast warning.
+  if (Downcast)
+    errs() << "A BLAS transform argument was larger than i32 and needed to be"
+              " downcast.\nThis operation is potentially illegal.\n";
+
+  // Prepare argument list
+  auto *I32 = IR.getInt32Ty();
+  auto *OpPtrTy = OpTy->getPointerTo();
+  Type *ArgTys[] = {I32,     I32, I32,     I32, I32,  I32,     OpTy,
+                    OpPtrTy, I32, OpPtrTy, I32, OpTy, OpPtrTy, I32};
+  Value *Args[] = {Layout, TransA, TransB, M,   N,    K, Alpha,
+                   A,      LDA,    B,      LDB, Beta, C, LDC};
+
+  // Insert prepared call in the IR
+  StringRef BlasFunctionName =
+      OpTy == IR.getFloatTy() ? "cblas_sgemm" : "cblas_dgemm";
+  insertNoInlineCall(Mod, IR, ArgTys, Args, BlasFunctionName);
+}
+
 // Adds a call to llvm.matrix.multiply to the IR
 void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
 
@@ -119,7 +272,10 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
   auto *N = IR.CreateSExt(&MB.getColumns(), IR.getInt64Ty());
   auto *K = IR.CreateSExt(&MA.getColumns(), IR.getInt64Ty());
 
-  // We are sure that the sizes are fixed thanks to matcher
+  assert(dyn_cast_or_null<ConstantInt>(M) && "M dimension is not a constant.");
+  assert(dyn_cast_or_null<ConstantInt>(N) && "N dimension is not a constant.");
+  assert(dyn_cast_or_null<ConstantInt>(K) && "K dimension is not a constant.");
+
   uint64_t MAsUInt64 = cast<ConstantInt>(M)->getZExtValue();
   uint64_t NAsUInt64 = cast<ConstantInt>(N)->getZExtValue();
   uint64_t KAsUInt64 = cast<ConstantInt>(K)->getZExtValue();
@@ -169,8 +325,8 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
       Beta = ConstantFP::get(CElType, APFloat(1.));
     NewC = MBuilder.CreateAdd(
         NewC, MBuilder.CreateScalarMultiply(
-                  Beta, loadMatrixToFlatVector(MBuilder, CPtr, *M, *N, *LDC,
-                                               IsCColMajor, CAlign)));
+                  Beta, loadMatrixToFlatVector(MBuilder, *CElType, CPtr, *M, *N,
+                                               *LDC, IsCColMajor, CAlign)));
   }
 
   // Store result into C
@@ -232,7 +388,15 @@ bool runImpl(Function &F, GEMMMatcher::Result &GMPR) {
 
     // Make the call to llvm.matrix.multiply
     IRBuilder<> IR(ExitBlock, ExitBlock->getFirstInsertionPt());
-    buildMMIntrinsicCall(IR, GEMM);
+
+    if (ReplaceMode == GEMMFaRer::MatrixIntrinsics)
+      // Make the call to llvm.matrix.multiply
+      buildMMIntrinsicCall(IR, GEMM);
+    else if (ReplaceMode == GEMMFaRer::CBLAS)
+      // Make the call using the CBLAS interface
+      buildBLASGEMMCall(*F.getParent(), IR, GEMM);
+    else
+      assert(0 && "Unknown GeMM replacement mode!");
 
     // Delete reduction store to Matrix C, thus making the reduction dead-code
     GEMM.getReductionStore().eraseFromParent();

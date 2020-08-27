@@ -186,9 +186,9 @@ struct CombineOrWithReset_match {
   template <typename ITy> bool match(ITy *V) {
     if (L.match(V))
       return true;
-    for (Value **V : Values)
-      if (V != nullptr)
-        (*V) = nullptr;
+    for (Value **ResetV : Values)
+      if (ResetV != nullptr)
+        (*ResetV) = nullptr;
     return R.match(V);
   }
 };
@@ -208,9 +208,9 @@ m_CombineOrWithReset(const Op1Ty &Op1, const Op2Ty &Op2, ValuesTy... Values) {
 // floating-point value. The return matcher matches expression in the form of
 // alpha * X  or Y, where * is FMul instruction.
 // TODO: add support for types other than floating-point
-template <typename LHSTy, typename RHSTy, typename... ValuesTy>
-inline auto scaledValueOrValue(LHSTy LHS, RHSTy RHS, ValuesTy... Values) {
-  return m_CombineOrWithReset(m_c_FMul(LHS, RHS), RHS, Values...);
+template <typename OpTy>
+inline auto scaledValueOrValue(OpTy V, Value *&Scalar) {
+  return m_CombineOrWithReset(m_c_FMul(m_Value(Scalar), V), V, &Scalar);
 }
 
 // A helper function that returns a matcher of a linear function of two PHI
@@ -270,14 +270,15 @@ inline auto match1Dor2DLoadAndIndices(Value *&PtrOp, PHINode *&Idx1,
 // used as indexes into each array (IdxA1/2 & IdxB1/2) and, if part of the
 // indexing expression, the leading dimension of each array.
 // TODO: add support for types other than floating-point
-inline auto matchFMulFAddPattern(Value *const &AddResult, Value *&MulLHS,
-                                 Value *&MulRHS, PHINode *&IdxA1,
-                                 PHINode *&IdxA2, PHINode *&IdxB1,
-                                 PHINode *&IdxB2, Value *&LDA, Value *&LDB) {
-  return m_c_FAdd(
-      m_PHI(m_Zero(), m_Specific(AddResult)),
-      m_c_FMul(match1Dor2DLoadAndIndices(MulLHS, IdxA1, IdxA2, LDA),
-               match1Dor2DLoadAndIndices(MulRHS, IdxB1, IdxB2, LDB)));
+inline auto matchFMulFAddPattern(Value *&MulLHS, Value *&MulRHS,
+                                 PHINode *&IdxA1, PHINode *&IdxA2,
+                                 PHINode *&IdxB1, PHINode *&IdxB2, Value *&LDA,
+                                 Value *&LDB, Value *&Alpha) {
+  auto LHS = match1Dor2DLoadAndIndices(MulLHS, IdxA1, IdxA2, LDA);
+  auto RHS = match1Dor2DLoadAndIndices(MulRHS, IdxB1, IdxB2, LDB);
+  return m_c_FAdd(m_Value(),
+                  m_CombineOr(m_c_FMul(scaledValueOrValue(LHS, Alpha), RHS),
+                              m_c_FMul(m_Value(Alpha), m_c_FMul(LHS, RHS))));
 }
 
 // A helper function that returns a matcher of a store into a flat or 2D array
@@ -285,9 +286,16 @@ inline auto matchFMulFAddPattern(Value *const &AddResult, Value *&MulLHS,
 template <typename MatcherType>
 inline auto matchStoreOfMatrixC(MatcherType ReductionMatcher, Value *&C,
                                 PHINode *&IdxC1, PHINode *&IdxC2, Value *&LDC,
-                                const Value *GEP) {
-  return m_Store(m_OneOf(ReductionMatcher, m_PHI(m_Zero(), ReductionMatcher)),
-                 match1Dor2DPtrOpAndInductionVariables(C, IdxC1, IdxC2, LDC));
+                                Value *&GEP, Value *&Alpha, Value *&Beta) {
+  return m_Store(
+      m_OneOf(scaledValueOrValue(ReductionMatcher, Alpha),
+              scaledValueOrValue(m_PHI(m_Value(), ReductionMatcher), Beta),
+              m_c_FAdd(scaledValueOrValue(m_Load(m_Value(GEP)), Beta),
+                       scaledValueOrValue(
+                           m_CombineOr(m_PHI(m_Zero(), ReductionMatcher),
+                                       ReductionMatcher),
+                           Alpha))),
+      match1Dor2DPtrOpAndInductionVariables(C, IdxC1, IdxC2, LDC));
 }
 
 // A helper function that returns the outermost PHINode (induction variable)
@@ -577,34 +585,48 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
 // false. When this function returns true all incoming arguments (except
 // SeedInst) are set to capture values in the IR that describe the
 // Matrix-Multiply.
-static bool matchMatMul(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
-                        Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
-                        Value *&BasePtrToC, Value *&LDA, Value *&LDB,
-                        Value *&LDC, MatrixLayout &ALayout,
-                        MatrixLayout &BLayout, MatrixLayout &CLayout,
-                        LoopInfo &LI) {
+static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
+                      Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
+                      Value *&BasePtrToC, Value *&LDA, Value *&LDB, Value *&LDC,
+                      MatrixLayout &ALayout, MatrixLayout &BLayout,
+                      MatrixLayout &CLayout, LoopInfo &LI, Value *&Alpha,
+                      Value *&Beta, bool &IsCReduced) {
   auto *SeedInstAsValue = static_cast<Value *>(&SeedInst);
+  Value *Alpha1 = nullptr;
   PHINode *APHI1 = nullptr;
   PHINode *APHI2 = nullptr;
   PHINode *BPHI1 = nullptr;
   PHINode *BPHI2 = nullptr;
   PHINode *CPHI1 = nullptr;
   PHINode *CPHI2 = nullptr;
+  const auto *LoadPtrOp = SeedInst.getOperand(1);
+  Value *MatchedGEP = nullptr;
 
   // MatMul matcher
-  auto ReductionMatcher =
-      matchFMulFAddPattern(SeedInst.getOperand(0), BasePtrToA, BasePtrToB,
-                           APHI1, APHI2, BPHI1, BPHI2, LDA, LDB);
+  auto ReductionMatcher = matchFMulFAddPattern(
+      BasePtrToA, BasePtrToB, APHI1, APHI2, BPHI1, BPHI2, LDA, LDB, Alpha);
   auto Matcher = matchStoreOfMatrixC(ReductionMatcher, BasePtrToC, CPHI1, CPHI2,
-                                     LDC, SeedInst.getOperand(1));
+                                     LDC, MatchedGEP, Alpha1, Beta);
 
-  bool IsMatMul = false;
+  bool IsGEMM = false;
   if (match(SeedInstAsValue, Matcher) && BasePtrToA != BasePtrToC &&
       BasePtrToB != BasePtrToC &&
+      // prevents the match of double scaling with alpha
+      (Alpha == nullptr || Alpha1 == nullptr) &&
+      // LoadPtrOP equals MatchedGEP when old values of C is part of reduction,
+      // i.e., when we have expressions of the form:
+      // C = alpha? * A * B + beta? * C
+      (MatchedGEP == nullptr || MatchedGEP == LoadPtrOp) &&
       matchMatrixLayout(APHI1, APHI2, BPHI1, BPHI2, CPHI1, CPHI2, ALayout,
-                        BLayout, CLayout, IVarI, IVarJ, IVarK, LI))
-    IsMatMul = true;
-  return IsMatMul;
+                        BLayout, CLayout, IVarI, IVarJ, IVarK, LI)) {
+    // If Alpha is not match with the reduction matcher, use the matched value
+    // from the store matcher.
+    if (Alpha == nullptr)
+      Alpha = Alpha1;
+    IsCReduced = MatchedGEP != nullptr || Beta != nullptr;
+    IsGEMM = true;
+  }
+  return IsGEMM;
 }
 
 // A Helper function to get leading dimension value. In case V is the RHS of a
@@ -630,29 +652,40 @@ void setLeadingDimensionValue(BasicBlock &FunEntryBB, Loop &L,
 // function adds to \p Stores all the store instructions that store the value 0
 // to matrix C, which has base address \p C, in the effective address computed
 // with \p LDC, IVarI, and IVarJ that are within loop \p L.
-static void
-collectOtherGeMMStoresToC(const Value *C, const Value *LDC, const Value *IVarI,
-                          const Value *IVarJ, const Loop *L,
-                          const Instruction &ReductionStore, DominatorTree &DT,
-                          SmallSetVector<const Value *, 2> &Stores) {
-  auto *ReductionBB = ReductionStore.getParent();
+static void collectOtherGeMMStoresToC(
+    const Value *C, const Value *LDC, const Value *IVarI, const Value *IVarJ,
+    const Value *Alpha, const Value *Beta, const Loop *L,
+    const Instruction &ReductionStore, DominatorTree &DT,
+    SmallSetVector<const Value *, 2> &Stores, bool &IsCReduced) {
+  const auto *ReductionBB = ReductionStore.getParent();
   for (auto *BB : L->getBlocks()) {
     for (auto Inst = BB->begin(); Inst != BB->end(); Inst++) {
       if (isa<StoreInst>(Inst)) {
         auto *InstAsValue = static_cast<Value *>(&*Inst);
-        Value *_C = nullptr;
-        Value *_LDC = nullptr;
+        Value *C1 = nullptr;
+        Value *LDC1 = nullptr;
         PHINode *PHI1 = nullptr;
         PHINode *PHI2 = nullptr;
-        auto matcher = m_Store(m_Zero(), match1Dor2DPtrOpAndInductionVariables(
-                                             _C, PHI1, PHI2, _LDC));
-        if (match(InstAsValue, matcher) && C == _C &&
-            (_LDC == nullptr || _LDC == LDC) &&
+        Value *Alpha1 = nullptr;
+        Value *Beta1 = nullptr;
+        Value *GEP = Inst->getOperand(1);
+        auto StoreMatcher = m_Store(
+            m_OneOf(m_Constant(), scaledValueOrValue(m_Zero(), Alpha1),
+                    scaledValueOrValue(m_Load(m_Specific(GEP)), Beta1),
+                    m_c_FAdd(scaledValueOrValue(m_Load(m_Specific(GEP)), Beta1),
+                             scaledValueOrValue(m_Zero(), Alpha1))),
+            match1Dor2DPtrOpAndInductionVariables(C1, PHI1, PHI2, LDC1));
+        if (match(InstAsValue, StoreMatcher) && C == C1 &&
+            (LDC1 == nullptr || LDC1 == LDC) &&
+            ((Alpha == nullptr || Alpha1 == nullptr) || Alpha == Alpha1) &&
+            ((Beta == nullptr || Beta1 == nullptr) || Beta == Beta1) &&
             (IVarI == extractOutermostPHI(PHI1) ||
              IVarI == extractOutermostPHI(PHI2) ||
              IVarJ == extractOutermostPHI(PHI1) ||
              IVarJ == extractOutermostPHI(PHI2)) &&
             DT.dominates(BB, ReductionBB) && BB != ReductionBB) {
+          if (Beta1 != nullptr)
+            IsCReduced = true;
           Stores.insert(InstAsValue);
         }
       }
@@ -684,16 +717,19 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         Value *M = nullptr;
         Value *N = nullptr;
         Value *K = nullptr;
+        Value *Alpha = nullptr;
+        Value *Beta = nullptr;
         MatrixLayout ALayout;
         MatrixLayout BLayout;
         MatrixLayout CLayout;
+        bool IsCReduced = false;
         SmallSetVector<const llvm::Value *, 2> Stores;
 
         // Check that the loops for this store intstruction match the
         // Matrix-Multiply pattern
-        if (!(matchMatMul(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
-                          BasePtrToC, LDA, LDB, LDC, ALayout, BLayout, CLayout,
-                          LI) &&
+        if (!(matchGEMM(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
+                        BasePtrToC, LDA, LDB, LDC, ALayout, BLayout, CLayout,
+                        LI, Alpha, Beta, IsCReduced) &&
               matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
               matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
               matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K))) {
@@ -757,10 +793,12 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *M, *N, *IVarI, *IVarJ);
 
         Stores.insert(&*Inst);
-        collectOtherGeMMStoresToC(BasePtrToC, MatchedLDC, IVarI, IVarJ,
-                                  OuterLoop, *Inst, DT, Stores);
+        collectOtherGeMMStoresToC(BasePtrToC, MatchedLDC, IVarI, IVarJ, Alpha,
+                                  Beta, OuterLoop, *Inst, DT, Stores,
+                                  IsCReduced);
 
-        GEMM GEMM(*OuterLoop, *Inst, MatrixA, MatrixB, MatrixC, Stores);
+        GEMM GEMM(*OuterLoop, *Inst, MatrixA, MatrixB, MatrixC, Stores,
+                  IsCReduced, Alpha, Beta);
         ListOfGEMMs->push_back(std::move(GEMM));
       }
     }

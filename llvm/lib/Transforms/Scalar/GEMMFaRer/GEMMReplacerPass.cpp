@@ -154,10 +154,27 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
   Value *CVec = MBuilder.CreateMatrixMultiply(AVec, BVec, MAsUInt64, KAsUInt64,
                                               NAsUInt64);
 
+  auto *Alpha = Gemm.getAlpha();
+  auto *Beta = Gemm.getBeta();
+
+  Value *NewC = CVec;
+  if (Alpha != nullptr)
+    NewC = MBuilder.CreateScalarMultiply(Alpha, CVec);
+
   auto IsCColMajor = MC.getLayout() == GEMMFaRer::ColMajor;
   auto const &CAlign = Align(BElType->getPrimitiveSizeInBits() / BitsInAByte);
+
+  if (Gemm.IsCReduced()) {
+    if (Beta == nullptr)
+      Beta = ConstantFP::get(CElType, APFloat(1.));
+    NewC = MBuilder.CreateAdd(
+        NewC, MBuilder.CreateScalarMultiply(
+                  Beta, loadMatrixToFlatVector(MBuilder, CPtr, *M, *N, *LDC,
+                                               IsCColMajor, CAlign)));
+  }
+
   // Store result into C
-  storeFlatVectorMatrix(MBuilder, *CVec, CPtr, *M, *N, *LDC, IsCColMajor,
+  storeFlatVectorMatrix(MBuilder, *NewC, CPtr, *M, *N, *LDC, IsCColMajor,
                         CAlign);
 }
 

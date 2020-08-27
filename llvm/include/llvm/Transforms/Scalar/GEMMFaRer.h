@@ -67,6 +67,7 @@ class GEMM {
   Matrix MatrixA;
   Matrix MatrixB;
   Matrix MatrixC;
+  bool CIsReduced;
   Value *Alpha;
   Value *Beta;
   SmallSetVector<const Value *, 2> Stores;
@@ -74,10 +75,11 @@ class GEMM {
 public:
   GEMM(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
        Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
-       Value *Alpha = nullptr, Value *Beta = nullptr)
+       bool CIsReduced, Value *Alpha = nullptr, Value *Beta = nullptr)
       : L(L), ReductionStore(RS), MatrixA(std::move(MatrixA)),
-        MatrixB(std::move(MatrixB)), MatrixC(std::move(MatrixC)), Alpha(Alpha),
-        Beta(Beta), Stores(std::move(Stores)) {}
+        MatrixB(std::move(MatrixB)), MatrixC(std::move(MatrixC)),
+        CIsReduced(CIsReduced), Alpha(Alpha), Beta(Beta),
+        Stores(std::move(Stores)) {}
 
   Loop &getAssociatedLoop() const { return L; }
 
@@ -92,6 +94,9 @@ public:
   Value *getAlpha() const { return Alpha; }
 
   Value *getBeta() const { return Beta; }
+
+  /// This method indicates if C is part of the reduction or not.
+  bool IsCReduced() const { return CIsReduced; }
 
   /// This predicate method determines if \p Store is a store to GEMM's result
   /// matrix.

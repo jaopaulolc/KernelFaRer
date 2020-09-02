@@ -29,7 +29,7 @@ namespace GEMMFaRer {
 
 /// Available replacement modes
 ///
-/// CBLAS - matched GEMM is replaced with a call to cblas_Xgemm
+/// CBLAS - matched Kernel is replaced with a call to cblas_X
 /// MatrixIntrinsics - matched GEMM is replaced with calls to llvm.matrix.*
 enum ReplacementMode : uint8_t { CBLAS, MatrixIntrinsics, UNKNOWN = 0xFF };
 
@@ -42,6 +42,9 @@ enum CBLAS_TRANSPOSE {
   ConjTrans = 113,
   ConjNoTrans = 114
 };
+enum CBLAS_UPLO { Upper = 121, Lower = 122 };
+enum CBLAS_DIAG { NonUnit = 131, Unit = 132 };
+enum CBLAS_SIDE { Left = 141, Right = 142 };
 
 /// Class that represents a matrix extracted from GEMM
 class Matrix {
@@ -72,41 +75,55 @@ public:
   Value &getColumnIV() const { return ColumnIV; }
 }; // class Matrix
 
-/// Class that represents a triple-nested loop that computes a general
-/// matrix-matrix multiply.
-class GEMM {
+/// Abstract class that represents a kernel computed within a triple-nested
+/// loop.
+class Kernel {
+public:
+  enum KernelType { GEMM_KERNEL, SYR2K_KERNEL, UNKNOWN_KERNEL = 0xff };
+
+protected:
+  KernelType KernelID;
   Loop &L;
   Instruction &ReductionStore;
   Matrix MatrixA;
   Matrix MatrixB;
   Matrix MatrixC;
-  bool CIsReduced;
   Value *Alpha;
   Value *Beta;
   SmallSetVector<const Value *, 2> Stores;
 
 public:
+  Kernel(KernelType KernelID, Loop &L, Instruction &RS, Matrix &MatrixA,
+         Matrix &MatrixB, Matrix &MatrixC,
+         SmallSetVector<const Value *, 2> Stores, Value *Alpha = nullptr,
+         Value *Beta = nullptr)
+      : KernelID(KernelID), L(L), ReductionStore(RS),
+        MatrixA(std::move(MatrixA)), MatrixB(std::move(MatrixB)),
+        MatrixC(std::move(MatrixC)), Alpha(Alpha), Beta(Beta),
+        Stores(std::move(Stores)) {}
+  Loop &getAssociatedLoop() const { return L; }
+  Instruction &getReductionStore() const { return ReductionStore; }
+  const Matrix &getMatrixA() const { return MatrixA; }
+  const Matrix &getMatrixB() const { return MatrixB; }
+  const Matrix &getMatrixC() const { return MatrixC; }
+  Value *getAlpha() const { return Alpha; }
+  Value *getBeta() const { return Beta; }
+  KernelType getKernelID() const { return KernelID; }
+
+  virtual bool isKernelStore(const Value &Store) const = 0;
+  virtual bool isKernelValue(const Value &V) const = 0;
+}; // class Kernel
+
+/// Class that represents a triple-nested loop that computes a general
+/// matrix-matrix multiply.
+class GEMM : public Kernel {
+  bool CIsReduced;
+public:
   GEMM(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
        Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
        bool CIsReduced, Value *Alpha = nullptr, Value *Beta = nullptr)
-      : L(L), ReductionStore(RS), MatrixA(std::move(MatrixA)),
-        MatrixB(std::move(MatrixB)), MatrixC(std::move(MatrixC)),
-        CIsReduced(CIsReduced), Alpha(Alpha), Beta(Beta),
-        Stores(std::move(Stores)) {}
-
-  Loop &getAssociatedLoop() const { return L; }
-
-  Instruction &getReductionStore() const { return ReductionStore; }
-
-  const Matrix &getMatrixA() const { return MatrixA; }
-
-  const Matrix &getMatrixB() const { return MatrixB; }
-
-  const Matrix &getMatrixC() const { return MatrixC; }
-
-  Value *getAlpha() const { return Alpha; }
-
-  Value *getBeta() const { return Beta; }
+      : Kernel(Kernel::GEMM_KERNEL, L, RS, MatrixA, MatrixB, MatrixC, Stores,
+               Alpha, Beta), CIsReduced(CIsReduced) {}
 
   /// This method indicates if C is part of the reduction or not.
   bool IsCReduced() const { return CIsReduced; }
@@ -119,7 +136,7 @@ public:
   ///
   /// \returns true if \p Store store into GEMM's result matrix and false
   /// otherwise.
-  bool isGemmStore(const Value &Store) const {
+  bool isKernelStore(const Value &Store) const {
     return Stores.count(&Store) != 0;
   }
 
@@ -129,7 +146,7 @@ public:
   /// \param V a value to be checked if it is used to compute GEMM
   ///
   /// \returns true if \p V is used to compute GEMM and false otherwise.
-  bool isGemmValue(const Value &V) const {
+  bool isKernelValue(const Value &V) const {
 
     auto &M = MatrixA.getRows();
     auto &K = MatrixA.getColumns();
@@ -152,19 +169,66 @@ public:
             &V == &ABaseAddr || &V == &BBaseAddr || &V == &CBaseAddr ||
             &V == &LDA || &V == &LDB || &V == &LDC);
   }
+
+  static inline bool classof(GEMM const *) { return true; }
+  static inline bool classof(Kernel const *K) {
+    return K->getKernelID() == Kernel::GEMM_KERNEL;
+  }
 }; // class GEMM
+
+class SYR2K : public Kernel {
+  Value *Uplo;
+
+public:
+  SYR2K(Loop &L, Instruction &RS, Matrix &MatrixA, Matrix &MatrixB,
+        Matrix &MatrixC, SmallSetVector<const Value *, 2> Stores,
+        Value *Alpha = nullptr, Value *Beta = nullptr, Value *Uplo = nullptr)
+      : Kernel(Kernel::SYR2K_KERNEL, L, RS, MatrixA, MatrixB, MatrixC, Stores,
+               Alpha, Beta),
+        Uplo(Uplo) {}
+
+  Value *getUplo() const { return Uplo; }
+
+  bool isKernelStore(const Value &Store) const {
+    return Stores.count(&Store) != 0;
+  }
+
+  bool isKernelValue(const Value &V) const {
+
+    auto &N = MatrixA.getRows();
+    auto &K = MatrixA.getColumns();
+
+    auto &IndVarI = MatrixA.getRowIV();
+    auto &IndVarK = MatrixA.getColumnIV();
+    auto &IndVarJ = MatrixB.getColumnIV();
+
+    return (&V == Alpha || &V == Beta || &V == &IndVarI || &V == &IndVarJ ||
+            &V == &IndVarK || &V == &N || &V == &K ||
+            &V == &MatrixA.getBaseAddressPointer() ||
+            &V == &MatrixB.getBaseAddressPointer() ||
+            &V == &MatrixC.getBaseAddressPointer() ||
+            &V == &MatrixA.getLeadingDimensionSize() ||
+            &V == &MatrixB.getLeadingDimensionSize() ||
+            &V == &MatrixC.getLeadingDimensionSize());
+  }
+
+  static inline bool classof(SYR2K const *) { return true; }
+  static inline bool classof(Kernel const *K) {
+    return K->getKernelID() == Kernel::SYR2K_KERNEL;
+  }
+}; // class SYR2K
 
 /// Performs Matrix-Multiply Recognition Pass.
 struct GEMMMatcher {
 public:
-  using Result = std::unique_ptr<SmallVector<GEMM, 4>>;
+  using Result = std::unique_ptr<SmallVector<std::unique_ptr<Kernel>, 4>>;
   static Result run(Function &F, LoopInfo &LI, DominatorTree &DT);
 };
 
 /// Checks if GEMM can be replaced with a call to llvm.matrix.multiply.*
 struct GEMMDataAnalysisPass {
 public:
-  static bool run(GEMM &GeMM);
+  static bool run(Kernel &Ker);
 };
 
 } // end of namespace GEMMFaRer

@@ -21,7 +21,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PatternMatch.h"
@@ -264,6 +263,13 @@ inline auto match1Dor2DLoadAndIndices(Value *&PtrOp, PHINode *&Idx1,
   return m_Load(match1Dor2DPtrOpAndInductionVariables(PtrOp, Idx1, Idx2, LD));
 }
 
+template <typename MulLHSTy, typename MulRHSTy>
+inline auto floatMultiplyWithScalar(MulLHSTy MulLHS, MulRHSTy MulRHS,
+                                    Value *&Scalar) {
+  return m_CombineOr(m_c_FMul(scaledValueOrValue(MulLHS, Scalar), MulRHS),
+                     m_c_FMul(m_Value(Scalar), m_c_FMul(MulLHS, MulRHS)));
+}
+
 // A helper function that returns a matcher of a floating-point
 // multiply-accumulate pattern involving two arrays. The returned matcher
 // captures both multiplied arrays (MulLHS & MulRHS), the PHINode instructions
@@ -276,9 +282,7 @@ inline auto matchFMulFAddPattern(Value *&MulLHS, Value *&MulRHS,
                                  Value *&LDB, Value *&Alpha) {
   auto LHS = match1Dor2DLoadAndIndices(MulLHS, IdxA1, IdxA2, LDA);
   auto RHS = match1Dor2DLoadAndIndices(MulRHS, IdxB1, IdxB2, LDB);
-  return m_c_FAdd(m_Value(),
-                  m_CombineOr(m_c_FMul(scaledValueOrValue(LHS, Alpha), RHS),
-                              m_c_FMul(m_Value(Alpha), m_c_FMul(LHS, RHS))));
+  return m_c_FAdd(m_Value(), floatMultiplyWithScalar(LHS, RHS, Alpha));
 }
 
 // A helper function that returns a matcher of a store into a flat or 2D array
@@ -298,6 +302,18 @@ inline auto matchStoreOfMatrixC(MatcherType ReductionMatcher, Value *&C,
       match1Dor2DPtrOpAndInductionVariables(C, IdxC1, IdxC2, LDC));
 }
 
+// A helper function that returns a matcher of a store into a flat or 2D array
+// C of the result of a reduction pattern matched by ReductionMatcher.
+inline auto matchSYR2KStore(const Value *C, Value *&AddLHS, Value *&AddRHS) {
+  return m_CombineOr(
+      m_Store(m_c_FAdd(m_PHI(m_Value(), m_Value()),
+                       m_c_FAdd(m_Value(AddLHS), m_Value(AddRHS))),
+              m_Specific(C)),
+      m_Store(m_c_FAdd(m_Load(m_Specific(C)),
+                       m_c_FAdd(m_Value(AddLHS), m_Value(AddRHS))),
+              m_Specific(C)));
+}
+
 // A helper function that returns the outermost PHINode (induction variable)
 // associated with V. The outermost induction variable has two incomming
 // values, a initialization value (ConstantInt) and a post-increment value
@@ -314,11 +330,11 @@ inline PHINode *extractOutermostPHI(PHINode *const &V) {
     const auto *PHI = WorkQueue.front();
     WorkQueue.remove(PHI);
 
-    if (match(PHI,
-              m_OneOf(
-                  m_PHI(m_c_Add(m_Specific(PHI), m_Value()), m_ConstantInt()),
-                  m_PHI(m_ConstantInt(), m_c_Add(m_Specific(PHI), m_Value())),
-                  m_PHI(m_ConstantInt(), m_ConstantInt()))))
+    if (match(
+            PHI,
+            m_OneOf(m_PHI(m_c_Add(m_Specific(PHI), m_Value()), m_ConstantInt()),
+                    m_PHI(m_ConstantInt(), m_c_Add(m_Specific(PHI), m_Value())),
+                    m_PHI(m_ConstantInt(), m_ConstantInt()))))
       return const_cast<PHINode *>(PHI);
 
     for (const Use &Op : PHI->incoming_values())
@@ -415,7 +431,8 @@ static bool matchLoopUpperBound(LoopInfo &LI, PHINode *IndVar, Value *&UBound) {
         // For loops with trip_count == 2, Combine redundant instructions
         // replaces the integer induction variable with a phi(true, false)
         if (auto *Phi = dyn_cast<PHINode>(BR->getCondition()))
-          if (match(Phi, m_CombineOr(m_PHI(m_Zero(), m_One()), m_PHI(m_One(), m_Zero())))) {
+          if (match(Phi, m_CombineOr(m_PHI(m_Zero(), m_One()),
+                                     m_PHI(m_One(), m_Zero())))) {
             IRBuilder<> IR(&Header->getParent()->getEntryBlock());
             UBound = IR.getInt64(2);
             return true;
@@ -424,16 +441,16 @@ static bool matchLoopUpperBound(LoopInfo &LI, PHINode *IndVar, Value *&UBound) {
           ICmpInst::Predicate Pred;
           // Iterate over header phis, find the one that matches the upper
           // bound
-          for (BasicBlock::const_iterator I = Header->begin();
-               isa<PHINode>(I); I++) {
+          for (BasicBlock::const_iterator I = Header->begin(); isa<PHINode>(I);
+               I++) {
             const auto *PHI = static_cast<const Value *>(&*I);
-            if (!match(CMP, m_c_ICmp(Pred,
-                                     m_CombineOr(
-                                         m_Specific(PHI),
-                                         m_c_Add(m_Specific(PHI), m_Value())),
-                                     m_OneOf(m_ZExt(m_Value(UBound)),
-                                             m_SExt(m_Value(UBound)),
-                                             m_Value(UBound)))))
+            if (!match(CMP,
+                       m_c_ICmp(
+                           Pred,
+                           m_CombineOr(m_Specific(PHI),
+                                       m_c_Add(m_Specific(PHI), m_Value())),
+                           m_OneOf(m_ZExt(m_Value(UBound)),
+                                   m_SExt(m_Value(UBound)), m_Value(UBound)))))
               continue;
             if (isa<PHINode>(UBound)) {
               // GEMM loops are not triangular.
@@ -571,6 +588,35 @@ bool matchMatrixLayout(PHINode *&A1, PHINode *&A2, PHINode *&B1, PHINode *&B2,
   return Matched;
 }
 
+static bool matchSyr2kIndVarAndLayout(Value *const &PtrToA, Value *&PtrToA2,
+                                      Value *const &PtrToB, Value *&PtrToB2,
+                                      SmallVector<PHINode *, 4> &APHI,
+                                      SmallVector<PHINode *, 4> &BPHI,
+                                      CBLAS_ORDER ALayout,
+                                      CBLAS_ORDER BLayout) {
+
+  // If RHS matched B as A and A as B, then we swap the matched induction
+  // variables and pointers.
+  if (PtrToA == PtrToB2 && PtrToB == PtrToA2) {
+    std::swap(APHI[2], BPHI[2]);
+    std::swap(APHI[3], BPHI[3]);
+    std::swap(PtrToA2, PtrToB2);
+  } else if (PtrToA != PtrToA2 || PtrToB != PtrToB2) {
+    // If RHS' pointers do not match LHS' pointers, then this is not a Syr2k.
+    return false;
+  }
+
+  if (ALayout == BLayout) {
+    if (APHI[0] == BPHI[3] && APHI[1] == BPHI[2] && BPHI[0] == APHI[3] &&
+        BPHI[1] == APHI[2])
+      return true;
+  } else if (APHI[0] == BPHI[2] && APHI[1] == BPHI[3] && BPHI[0] == APHI[2] &&
+             BPHI[1] == APHI[3])
+    return true;
+
+  return false;
+}
+
 // A helper function that returns true iff. SeedInst is a store instruction
 // that belongs to a Matrix-Multiply pattern. Otherwise this function returns
 // false. When this function returns true all incoming arguments (except
@@ -620,6 +666,50 @@ static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
   return IsGEMM;
 }
 
+static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
+                       Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
+                       Value *&BasePtrToC, Value *&LDA, Value *&LDB,
+                       Value *&LDC, CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
+                       CBLAS_ORDER &CLayout, Value *&Alpha, Value *&Beta,
+                       LoopInfo &LI) {
+  Value *SeedInstAsValue = static_cast<Value *>(&SeedInst);
+  Value *AddLHS = nullptr;
+  Value *AddRHS = nullptr;
+  SmallVector<PHINode *, 4> APHI = {nullptr, nullptr, nullptr, nullptr};
+  SmallVector<PHINode *, 4> BPHI = {nullptr, nullptr, nullptr, nullptr};
+  PHINode *CPHI1 = nullptr;
+  PHINode *CPHI2 = nullptr;
+  Value *BasePtrToA2 = nullptr;
+  Value *BasePtrToB2 = nullptr;
+  Value *LDA2 = nullptr;
+  Value *LDB2 = nullptr;
+  Value *Alpha1 = nullptr;
+  Value *StoreToC = SeedInst.getOperand(1);
+
+  auto StoreMatcher = matchSYR2KStore(StoreToC, AddLHS, AddRHS);
+
+  auto AddLHSMatcher = floatMultiplyWithScalar(
+      match1Dor2DLoadAndIndices(BasePtrToA, APHI[0], APHI[1], LDA),
+      match1Dor2DLoadAndIndices(BasePtrToB, BPHI[0], BPHI[1], LDB), Alpha);
+
+  auto AddRHSMatcher = floatMultiplyWithScalar(
+      match1Dor2DLoadAndIndices(BasePtrToA2, APHI[2], APHI[3], LDA2),
+      match1Dor2DLoadAndIndices(BasePtrToB2, BPHI[2], BPHI[3], LDB2), Alpha1);
+
+  bool IsSYR2K = false;
+  if (match(SeedInstAsValue, StoreMatcher) &&
+      match(StoreToC, match1Dor2DPtrOpAndInductionVariables(BasePtrToC, CPHI1,
+                                                            CPHI2, LDC)) &&
+      match(AddLHS, AddLHSMatcher) &&
+      matchMatrixLayout(APHI[0], APHI[1], BPHI[0], BPHI[1], CPHI1, CPHI2,
+                        ALayout, BLayout, CLayout, IVarI, IVarJ, IVarK, LI) &&
+      match(AddRHS, AddRHSMatcher) &&
+      matchSyr2kIndVarAndLayout(BasePtrToA, BasePtrToA2, BasePtrToB,
+                                BasePtrToB2, APHI, BPHI, ALayout, BLayout))
+    IsSYR2K = true;
+  return IsSYR2K;
+}
+
 // A Helper function to get leading dimension value. In case V is the RHS of a
 // Shl instruction, V is set to 1 << V. Otherwise V is unchanged.
 void setLeadingDimensionValue(BasicBlock &FunEntryBB, Loop &L,
@@ -643,7 +733,7 @@ void setLeadingDimensionValue(BasicBlock &FunEntryBB, Loop &L,
 // function adds to \p Stores all the store instructions that store the value 0
 // to matrix C, which has base address \p C, in the effective address computed
 // with \p LDC, IVarI, and IVarJ that are within loop \p L.
-static void collectOtherGeMMStoresToC(
+static void collectOtherKernelStoresToC(
     const Value *C, const Value *LDC, const Value *IVarI, const Value *IVarJ,
     const Value *Alpha, const Value *Beta, const Loop *L,
     const Instruction &ReductionStore, DominatorTree &DT,
@@ -688,7 +778,8 @@ namespace GEMMFaRer {
 
 GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
                                      DominatorTree &DT) {
-  auto ListOfGEMMs = std::make_unique<SmallVector<GEMM, 4>>();
+  auto ListOfKernels =
+      std::make_unique<SmallVector<std::unique_ptr<Kernel>, 4>>();
   SmallSetVector<const Loop *, 8> LoopsToProcess;
   collectLoopsWithDepthThreeOrDeeper(LI, LoopsToProcess);
   for (const auto *L : LoopsToProcess) {
@@ -716,20 +807,30 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         bool IsCReduced = false;
         SmallSetVector<const llvm::Value *, 2> Stores;
 
+        Kernel::KernelType KT = Kernel::KernelType::UNKNOWN_KERNEL;
+
         // Check that the loops for this store intstruction match the
-        // Matrix-Multiply pattern
-        if (!(matchGEMM(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
-                        BasePtrToC, LDA, LDB, LDC, ALayout, BLayout, CLayout,
-                        LI, Alpha, Beta, IsCReduced) &&
-              matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
-              matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
-              matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K))) {
+        // Syr2k pattern
+        if (matchSYR2K(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
+                       BasePtrToC, LDA, LDB, LDC, ALayout, BLayout, CLayout,
+                       Alpha, Beta, LI) &&
+            matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
+            matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
+          KT = Kernel::KernelType::SYR2K_KERNEL;
+          // Check that the loops for this store intstruction match the
+          // Matrix-Multiply pattern
+        } else if (matchGEMM(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
+                             BasePtrToC, LDA, LDB, LDC, ALayout, BLayout,
+                             CLayout, LI, Alpha, Beta, IsCReduced) &&
+                   matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
+                   matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
+                   matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
+          KT = Kernel::KernelType::GEMM_KERNEL;
+        } else
           continue;
-        }
 
         Loop *OuterLoop = getOuterLoop(LI, IVarI, IVarJ, IVarK);
-        // Verify that we only have one block we're exiting from. GEMMs
-        // don't exit halfway through.
+        // Verify that we only have one block we're exiting from.
         if (OuterLoop->getExitingBlock() == nullptr) {
           LLVM_DEBUG(dbgs() << "Loop had multiple exiting blocks.\n");
           continue;
@@ -746,55 +847,76 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         // matrix C
         Value *MatchedLDC = LDC;
 
-        // Note that LD* is determined first by the overall storage order
-        // then whether or not the matrix has been transposed.
-        if (LDA == nullptr) {
-          if (CLayout == GEMMFaRer::RowMajor)
-            LDA = ALayout == CLayout ? K : M;
-          else
-            LDA = ALayout == CLayout ? M : K;
-        } else {
-          setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarI, IVarK,
-                                   LDA);
-        }
-
-        if (LDB == nullptr) {
-          if (CLayout == GEMMFaRer::RowMajor)
-            LDB = BLayout == CLayout ? N : K;
-          else
-            LDB = BLayout == CLayout ? K : N;
-        } else {
-          setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarK, IVarJ,
-                                   LDB);
-        }
-
-        if (LDC == nullptr) {
-          if (CLayout == GEMMFaRer::RowMajor)
-            LDC = N;
-          else
-            LDC = M;
-        } else {
-          setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarI, IVarJ,
-                                   LDC);
-        }
-
-        // Matrices constructed from matched values and deduced layouts.
-        Matrix MatrixA(*BasePtrToA, ALayout, *LDA, *M, *K, *IVarI, *IVarK);
-        Matrix MatrixB(*BasePtrToB, BLayout, *LDB, *K, *N, *IVarK, *IVarJ);
-        Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *M, *N, *IVarI, *IVarJ);
-
         Stores.insert(&*Inst);
-        collectOtherGeMMStoresToC(BasePtrToC, MatchedLDC, IVarI, IVarJ, Alpha,
-                                  Beta, OuterLoop, *Inst, DT, Stores,
-                                  IsCReduced);
+        collectOtherKernelStoresToC(BasePtrToC, MatchedLDC, IVarI, IVarJ, Alpha,
+                                    Beta, OuterLoop, *Inst, DT, Stores, IsCReduced);
 
-        GEMM GEMM(*OuterLoop, *Inst, MatrixA, MatrixB, MatrixC, Stores,
-                  IsCReduced, Alpha, Beta);
-        ListOfGEMMs->push_back(std::move(GEMM));
+        if (KT == Kernel::KernelType::SYR2K_KERNEL) {
+          // Note that LD* is determined first by the overall storage order
+          // then whether or not the matrix has been transposed.
+          if (LDA == nullptr)
+            LDA = ALayout == GEMMFaRer::RowMajor ? K : N;
+
+          // TODO: C = A * B_T in SYR2K so matchMatrixLayout yields layout of
+          // B_T
+          if (LDB == nullptr)
+            LDB = BLayout == GEMMFaRer::RowMajor ? N : K;
+
+          if (LDC == nullptr)
+            LDC = N;
+
+          // Matrices constructed from matched values and deduced layouts.
+          Matrix MatrixA(*BasePtrToA, ALayout, *LDA, *N, *K, *IVarI, *IVarK);
+          Matrix MatrixB(*BasePtrToB, BLayout, *LDB, *N, *K, *IVarI, *IVarK);
+          Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *N, *N, *IVarI, *IVarJ);
+          ListOfKernels->push_back(
+              std::make_unique<SYR2K>(*OuterLoop, *Inst, MatrixA, MatrixB,
+                                      MatrixC, Stores, Alpha, Beta));
+        } else {
+          // Note that LD* is determined first by the overall storage order
+          // then whether or not the matrix has been transposed.
+          if (LDA == nullptr) {
+            if (CLayout == GEMMFaRer::RowMajor)
+              LDA = ALayout == CLayout ? K : M;
+            else
+              LDA = ALayout == CLayout ? M : K;
+          } else {
+            setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarI,
+                                     IVarK, LDA);
+          }
+
+          if (LDB == nullptr) {
+            if (CLayout == GEMMFaRer::RowMajor)
+              LDB = BLayout == CLayout ? N : K;
+            else
+              LDB = BLayout == CLayout ? K : N;
+          } else {
+            setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarK,
+                                     IVarJ, LDB);
+          }
+
+          if (LDC == nullptr) {
+            if (CLayout == GEMMFaRer::RowMajor)
+              LDC = N;
+            else
+              LDC = M;
+          } else {
+            setLeadingDimensionValue(F.getEntryBlock(), *OuterLoop, IVarI,
+                                     IVarJ, LDC);
+          }
+
+          // Matrices constructed from matched values and deduced layouts.
+          Matrix MatrixA(*BasePtrToA, ALayout, *LDA, *M, *K, *IVarI, *IVarK);
+          Matrix MatrixB(*BasePtrToB, BLayout, *LDB, *K, *N, *IVarK, *IVarJ);
+          Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *M, *N, *IVarI, *IVarJ);
+          ListOfKernels->push_back(
+              std::make_unique<GEMM>(*OuterLoop, *Inst, MatrixA, MatrixB,
+                                     MatrixC, Stores, IsCReduced, Alpha, Beta));
+        }
       }
     }
   }
-  return ListOfGEMMs;
+  return ListOfKernels;
 }
 
 } // end of namespace GEMMFaRer

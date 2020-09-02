@@ -30,15 +30,15 @@ namespace GEMMFaRer {
 /// A loop nest L associated with \p GeMM cannot be replaced with
 /// llvm.matrix.multiply.* instrinsics if any of the following conditions hold:
 ///   - L contains any store instructions that write to memory other than to
-///   \p GeMM's result matrix;
+///   \p Ker's result matrix;
 ///   - L contains instructions with side-effects (e.g. I/O operations);
 ///   - L constains instructions that define values used outside of L.
-bool GEMMDataAnalysisPass::run(GEMM &GeMM) {
-  auto &L = GeMM.getAssociatedLoop();
+bool GEMMDataAnalysisPass::run(Kernel &Ker) {
+  auto &L = Ker.getAssociatedLoop();
 
   for (const auto &BB : L.getBlocks())
     for (const auto &Inst : *BB) {
-      if (GeMM.isGemmStore(Inst) || GeMM.isGemmValue(Inst))
+      if (Ker.isKernelStore(Inst) || Ker.isKernelValue(Inst))
         // Skip stores and values that belongs to GeMM
         continue;
       // Instructions with side-effects are *NOT* allowed.

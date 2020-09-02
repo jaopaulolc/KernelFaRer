@@ -36,10 +36,17 @@ using namespace GEMMFaRer;
 // Anonymous namespace containing rewriter functions.
 namespace {
 
+// Alpha and Beta can be passed through CLI for the cases when the matcher does
+// not yet match them
+cl::opt<double> AlphaInit("alpha", cl::desc("alpha"), cl::ValueRequired,
+                          cl::init(1.0));
+cl::opt<double> BetaInit("beta", cl::desc("beta"), cl::ValueRequired,
+                         cl::init(1.0));
+
 // Command line argument that determines which mode we are replacing in.
 cl::opt<GEMMFaRer::ReplacementMode> ReplaceMode(
     "gemmfarer-replacement-mode",
-    cl::desc("Available GeMM replacement methods."),
+    cl::desc("Available kernel replacement methods."),
     cl::values(clEnumValN(GEMMFaRer::MatrixIntrinsics, "matrix-intrinsics",
                           "Replace using llvm.matrix.* intrinsics."),
                clEnumValN(GEMMFaRer::CBLAS, "cblas-interface",
@@ -91,12 +98,12 @@ void storeFlatVectorMatrix(MatrixBuilder &MBuilder, Value &Matrix,
 
 /// A helper function to retrieve the scalar type of a value pointer.
 ///
-/// \param V a value pointer to a scalar type or a 2D array of scalar values
+/// \param M a value pointer to a scalar type or a 2D array of scalar values
 ///
 /// \returns the scalar type of a value pointer to 2D array or scalar pointed by
-/// \p V.
-Type *getMatrixElementType(const Value &V) {
-  auto *ElementType = V.getType()->getPointerElementType();
+/// \p M.
+Type *getMatrixElementType(const Value &M) {
+  auto *ElementType = M.getType()->getPointerElementType();
   if (ElementType->isArrayTy()) {
     ElementType = ElementType->getArrayElementType();
     if (ElementType->isArrayTy())
@@ -248,6 +255,66 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
   insertNoInlineCall(Mod, IR, ArgTys, Args, BlasFunctionName);
 }
 
+void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
+  // Saves function calls and characters
+  const Matrix &MA = Syr2k.getMatrixA();
+  const Matrix &MB = Syr2k.getMatrixB();
+  const Matrix &MC = Syr2k.getMatrixC();
+
+  // Options
+  ConstantInt *Layout = IR.getInt32(RowMajor);
+  ConstantInt *Uplo = IR.getInt32(Lower);
+  ConstantInt *Trans = IR.getInt32(NoTrans);
+
+  // BLAS interface only supports I32 so we will warn when we downcast.
+  bool Downcast = false;
+
+  // Dimension
+  auto *N = prepBLASInt32(IR, &MA.getRows(), Downcast);
+  auto *K = prepBLASInt32(IR, &MA.getColumns(), Downcast);
+
+  // Args for memory pointers to A, B, C
+  auto *A = getFlatPointerToMatrix(IR, MA);
+  auto *B = getFlatPointerToMatrix(IR, MB);
+  auto *C = getFlatPointerToMatrix(IR, MC);
+
+  // C's pointed to type defines the operation type.
+  Type *opTy = getMatrixElementType(*C);
+
+  // Make args for LDA, LDB, LDC
+  auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
+  auto *LDB = prepBLASInt32(IR, &MB.getLeadingDimensionSize(), Downcast);
+  auto *LDC = prepBLASInt32(IR, &MC.getLeadingDimensionSize(), Downcast);
+
+  // Send out downcast warning.
+  if (Downcast)
+    errs() << "A BLAS transform argument was larger than i32 and needed to be"
+              " downcast.\nThis operation is potentially illegal.\n";
+
+  // Make args for alpha/beta.
+  auto *Alpha = prepBLASScalar(IR, Syr2k.getAlpha(), opTy, AlphaInit);
+  auto *Beta = prepBLASScalar(IR, Syr2k.getBeta(), opTy, BetaInit);
+
+  // Sanity type checking.
+  assert(getMatrixElementType(*A) == opTy && "A and C are typed differently.");
+  assert(getMatrixElementType(*B) == opTy && "B and C are typed differently.");
+  assert(Alpha->getType() == opTy && "Alpha and C are typed differently.");
+  assert(Beta->getType() == opTy && "Beta and C are typed differently.");
+
+  // Prepare argument list
+  IntegerType *I32 = IR.getInt32Ty();
+  Type *opPtrTy = opTy->getPointerTo();
+  Type *ArgTys[] = {I32, I32,     I32, I32,  I32,     opTy, opPtrTy,
+                    I32, opPtrTy, I32, opTy, opPtrTy, I32};
+  Value *Args[] = {Layout, Uplo, Trans, N,    K, Alpha, A,
+                   LDA,    B,    LDB,   Beta, C, LDC};
+
+  // Insert prepared call in the IR
+  StringRef FunctionName =
+      (opTy == IR.getFloatTy()) ? "cblas_ssyr2k" : "cblas_dsyr2k";
+  insertNoInlineCall(Mod, IR, ArgTys, Args, FunctionName);
+}
+
 // Adds a call to llvm.matrix.multiply to the IR
 void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
 
@@ -345,23 +412,23 @@ bool runImpl(Function &F, GEMMMatcher::Result &GMPR) {
   bool Changed = false;
 
   // Iterate through all GEMMs found.
-  for (auto &GEMM : *GMPR) {
-    if (!GEMMDataAnalysisPass::run(GEMM)) {
-      LLVM_DEBUG(dbgs() << "GEMM not rewritable at line "
-                        << GEMM.getAssociatedLoop().getStartLoc().getLine()
+  for (std::unique_ptr<Kernel> &Ker : *GMPR) {
+    if (!GEMMDataAnalysisPass::run(*Ker)) {
+      LLVM_DEBUG(dbgs() << "Kernel not rewritable at line "
+                        << Ker->getAssociatedLoop().getStartLoc().getLine()
                         << '\n');
       continue;
     }
-    LLVM_DEBUG(dbgs() << "GEMM rewritable at line "
-                      << GEMM.getAssociatedLoop().getStartLoc().getLine()
+    LLVM_DEBUG(dbgs() << "Kernel rewritable at line "
+                      << Ker->getAssociatedLoop().getStartLoc().getLine()
                       << '\n');
     // Get the loop associated with this GEMM.
-    Loop &L = GEMM.getAssociatedLoop();
+    Loop &L = Ker->getAssociatedLoop();
 
     // We can't transform two dimensional pointers.
-    auto *ATy = GEMM.getMatrixA().getBaseAddressPointer().getType();
-    auto *BTy = GEMM.getMatrixB().getBaseAddressPointer().getType();
-    auto *CTy = GEMM.getMatrixC().getBaseAddressPointer().getType();
+    auto *ATy = Ker->getMatrixA().getBaseAddressPointer().getType();
+    auto *BTy = Ker->getMatrixB().getBaseAddressPointer().getType();
+    auto *CTy = Ker->getMatrixC().getBaseAddressPointer().getType();
     if (ATy->isPointerTy() && ATy->getPointerElementType()->isPointerTy()) {
       LLVM_DEBUG(dbgs() << "Matrix A was two dimensional pointer.\n");
       return false;
@@ -386,20 +453,25 @@ bool runImpl(Function &F, GEMMMatcher::Result &GMPR) {
     BasicBlock *ExitBlock = L.getExitBlock();
     assert(ExitBlock != nullptr && "Loop had multiple exit blocks.");
 
-    // Make the call to llvm.matrix.multiply
     IRBuilder<> IR(ExitBlock, ExitBlock->getFirstInsertionPt());
 
     if (ReplaceMode == GEMMFaRer::MatrixIntrinsics)
       // Make the call to llvm.matrix.multiply
-      buildMMIntrinsicCall(IR, GEMM);
-    else if (ReplaceMode == GEMMFaRer::CBLAS)
+      if (const auto *GEMM = dyn_cast_or_null<GEMMFaRer::GEMM>(Ker.get()))
+        buildMMIntrinsicCall(IR, *GEMM);
+      else
+        assert(0 && "Intrinsic only handles GEMM!");
+    else if (ReplaceMode == GEMMFaRer::CBLAS) {
       // Make the call using the CBLAS interface
-      buildBLASGEMMCall(*F.getParent(), IR, GEMM);
-    else
+      if (const auto *GEMM = dyn_cast_or_null<GEMMFaRer::GEMM>(Ker.get()))
+        buildBLASGEMMCall(*F.getParent(), IR, *GEMM);
+      if (const auto *SYR2K = dyn_cast_or_null<GEMMFaRer::SYR2K>(Ker.get()))
+        buildBLASSYR2KCall(*F.getParent(), IR, *SYR2K);
+    } else
       assert(0 && "Unknown GeMM replacement mode!");
 
     // Delete reduction store to Matrix C, thus making the reduction dead-code
-    GEMM.getReductionStore().eraseFromParent();
+    Ker->getReductionStore().eraseFromParent();
 
     // Mark that we changed here.
     Changed = true;

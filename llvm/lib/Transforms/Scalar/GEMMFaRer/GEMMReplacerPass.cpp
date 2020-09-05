@@ -50,8 +50,19 @@ cl::opt<GEMMFaRer::ReplacementMode> ReplaceMode(
     cl::values(clEnumValN(GEMMFaRer::MatrixIntrinsics, "matrix-intrinsics",
                           "Replace using llvm.matrix.* intrinsics."),
                clEnumValN(GEMMFaRer::CBLAS, "cblas-interface",
-                          "Replace using the CBLAS interface.")),
+                          "Replace using the CBLAS interface."),
+               clEnumValN(GEMMFaRer::EIGEN, "eigen-runtime",
+                          "Replace using the eigen runtime interface.")),
     cl::ValueRequired, cl::init(GEMMFaRer::UNKNOWN));
+
+// Constants are from Eigen enum values.
+// https://gitlab.com/libeigen/eigen/-/blob/master/Eigen/src/Core/util/Constants.h#L316
+constexpr int32_t EigenColMaj = 0;
+constexpr int32_t EigenRowMaj = 1;
+
+constexpr unsigned int EigenMaxArgs = 14;
+constexpr unsigned int EigenMaxFNameLen = 13;
+constexpr size_t EigenSizeWidth = 64;
 
 // A helper function that returns Matrix loaded in column-major order as a
 // flat-vector.
@@ -146,6 +157,18 @@ Value *prepBLASScalar(IRBuilder<> &IR, Value *V, Type *OpTy, double Init = 1.) {
     llvm_unreachable("Scalar needs to be either FloatTy or DoubleTy.");
   }
   return V != nullptr ? V : Scalar;
+}
+
+/// A helper function that uppercasts integer value to Int64 if needed
+///
+/// \param V a Value pointer to an integer value
+///
+/// \returns \p V or the uppercasted \p V
+auto *prepEigenInt64(IRBuilder<> &IR, Value *const &V) {
+  if (!V->getType()->isIntegerTy(EigenSizeWidth)) {
+    return IR.CreateIntCast(V, IR.getIntNTy(EigenSizeWidth), false);
+  }
+  return V;
 }
 
 /// A helper function that returns the base pointer to matrix \p M. If the
@@ -401,6 +424,110 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
                         CAlign);
 }
 
+// Adds the call to Eigen runtime
+void buildEigenCall(Module &Mod, IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
+
+  const GEMMFaRer::Matrix &MA = Gemm.getMatrixA();
+  const GEMMFaRer::Matrix &MB = Gemm.getMatrixB();
+  const GEMMFaRer::Matrix &MC = Gemm.getMatrixC();
+
+  // The vector of arguments.
+  SmallVector<Value *, EigenMaxArgs> Args;
+  SmallVector<Type *, EigenMaxArgs> ArgTys;
+
+  // Get args for A, B, C.
+  auto *A = getFlatPointerToMatrix(IR, MA);
+  auto *B = getFlatPointerToMatrix(IR, MB);
+  auto *C = getFlatPointerToMatrix(IR, MC);
+
+  // C's pointed to type defines the operation type.
+  Type *OpTy = getMatrixElementType(*C);
+
+  // Make args for alpha/beta.
+  Value *Alpha = Gemm.getAlpha();
+  Value *Beta = Gemm.getBeta();
+
+  // Sanity type checking.
+  assert(getMatrixElementType(*A) == OpTy && "A and C are typed differently.");
+  assert(getMatrixElementType(*B) == OpTy && "B and C are typed differently.");
+
+  // Add args and types for A, B, C.
+  Args.emplace_back(A);
+  Args.emplace_back(B);
+  Args.emplace_back(C);
+  for (size_t I = 0; I < 3; ++I) {
+    ArgTys.emplace_back(OpTy->getPointerTo());
+  }
+
+  // Make the function name
+  SmallString<EigenMaxFNameLen> FunctionName("_gemm");
+
+  // Check for and add alpha/beta and types.
+  if (Alpha != nullptr) {
+    FunctionName += "A";
+    Args.push_back(Alpha);
+    ArgTys.push_back(OpTy);
+    assert(Alpha->getType() == OpTy && "Alpha and C are typed differently.");
+  }
+  if (Beta != nullptr) {
+    FunctionName += "B";
+    Args.push_back(Beta);
+    ArgTys.push_back(OpTy);
+    assert(Beta->getType() == OpTy && "Beta and C are typed differently.");
+  }
+
+  // Finish the name.
+  if (OpTy->isIntegerTy()) {
+    FunctionName += "Uint";
+    FunctionName += std::to_string(OpTy->getIntegerBitWidth());
+  } else if (OpTy->isFloatTy()) {
+    FunctionName += "Float";
+  } else if (OpTy->isDoubleTy()) {
+    FunctionName += "Double";
+  } else {
+    llvm_unreachable("Unknown opTy for Eigen.");
+  }
+
+  // Make and add args and types for layout*.
+  bool ARowMajor = MA.getLayout() == GEMMFaRer::RowMajor;
+  bool BRowMajor = MB.getLayout() == GEMMFaRer::RowMajor;
+  bool CRowMajor = MC.getLayout() == GEMMFaRer::RowMajor;
+  Args.emplace_back(IR.getInt32(ARowMajor ? EigenRowMaj : EigenColMaj));
+  Args.emplace_back(IR.getInt32(BRowMajor ? EigenRowMaj : EigenColMaj));
+  Args.emplace_back(IR.getInt32(CRowMajor ? EigenRowMaj : EigenColMaj));
+  for (size_t I = 0; I < 3; ++I) {
+    ArgTys.emplace_back(IR.getInt32Ty());
+  }
+
+  // Make args for M, N, K.
+  auto *M = prepEigenInt64(IR, &MA.getRows());
+  auto *N = prepEigenInt64(IR, &MB.getColumns());
+  auto *K = prepEigenInt64(IR, &MA.getColumns());
+
+  // Add args and types for M, N, K.
+  Args.emplace_back(M);
+  Args.emplace_back(N);
+  Args.emplace_back(K);
+  for (size_t I = 0; I < 3; ++I) {
+    ArgTys.emplace_back(IR.getIntNTy(EigenSizeWidth));
+  }
+
+  // Make args for LDA, LDB, LDC.
+  auto *LDA = prepEigenInt64(IR, &MA.getLeadingDimensionSize());
+  auto *LDB = prepEigenInt64(IR, &MB.getLeadingDimensionSize());
+  auto *LDC = prepEigenInt64(IR, &MC.getLeadingDimensionSize());
+
+  // Add args and types for LDA, LDB, LDC.
+  Args.emplace_back(LDA);
+  Args.emplace_back(LDB);
+  Args.emplace_back(LDC);
+  for (size_t I = 0; I < 3; ++I) {
+    ArgTys.emplace_back(IR.getIntNTy(EigenSizeWidth));
+  }
+
+  insertNoInlineCall(Mod, IR, ArgTys, Args, FunctionName.str());
+}
+
 } // End anonymous namespace.
 
 namespace GEMMFaRer {
@@ -467,7 +594,13 @@ bool runImpl(Function &F, GEMMMatcher::Result &GMPR) {
         buildBLASGEMMCall(*F.getParent(), IR, *GEMM);
       if (const auto *SYR2K = dyn_cast_or_null<GEMMFaRer::SYR2K>(Ker.get()))
         buildBLASSYR2KCall(*F.getParent(), IR, *SYR2K);
-    } else
+    } else if (ReplaceMode == GEMMFaRer::EIGEN)
+      // Make the call using Eigen runtime interface
+      if (const auto *GEMM = dyn_cast_or_null<GEMMFaRer::GEMM>(Ker.get()))
+        buildEigenCall(*F.getParent(), IR, *GEMM);
+      else
+        assert(0 && "Intrinsic only handles GEMM!");
+    else
       assert(0 && "Unknown GeMM replacement mode!");
 
     // Delete reduction store to Matrix C, thus making the reduction dead-code

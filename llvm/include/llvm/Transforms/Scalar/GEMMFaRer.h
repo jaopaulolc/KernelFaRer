@@ -31,7 +31,12 @@ namespace GEMMFaRer {
 ///
 /// CBLAS - matched Kernel is replaced with a call to cblas_X
 /// MatrixIntrinsics - matched GEMM is replaced with calls to llvm.matrix.*
-enum ReplacementMode : uint8_t { CBLAS, MatrixIntrinsics, UNKNOWN = 0xFF };
+enum ReplacementMode : uint8_t {
+  EIGEN,
+  CBLAS,
+  MatrixIntrinsics,
+  UNKNOWN = 0xFF
+};
 
 // These constants are from
 // https://github.com/xianyi/OpenBLAS/blob/develop/cblas.h#L54-L58

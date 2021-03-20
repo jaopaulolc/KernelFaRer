@@ -77,6 +77,9 @@ add_llvm_component_library(LLVMScalarOpts
   StructurizeCFG.cpp
   TailRecursionElimination.cpp
   WarnMissedTransforms.cpp
+  KernelFaRer/KernelDataAnalysis.cpp
+  KernelFaRer/KernelMatcher.cpp
+  KernelFaRer/KernelReplacerPass.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms

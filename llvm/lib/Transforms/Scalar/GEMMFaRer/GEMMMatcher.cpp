@@ -22,6 +22,7 @@
 
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/raw_ostream.h"
@@ -282,7 +283,11 @@ inline auto matchFMulFAddPattern(Value *&MulLHS, Value *&MulRHS,
                                  Value *&LDB, Value *&Alpha) {
   auto LHS = match1Dor2DLoadAndIndices(MulLHS, IdxA1, IdxA2, LDA);
   auto RHS = match1Dor2DLoadAndIndices(MulRHS, IdxB1, IdxB2, LDB);
-  return m_c_FAdd(m_Value(), floatMultiplyWithScalar(LHS, RHS, Alpha));
+  return m_OneOf(
+      m_c_FAdd(m_Value(), floatMultiplyWithScalar(LHS, RHS, Alpha)),
+      m_Intrinsic<Intrinsic::fmuladd>(scaledValueOrValue(LHS, Alpha), RHS),
+      m_Intrinsic<Intrinsic::fmuladd>(LHS, scaledValueOrValue(RHS, Alpha))
+      );
 }
 
 // A helper function that returns a matcher of a store into a flat or 2D array

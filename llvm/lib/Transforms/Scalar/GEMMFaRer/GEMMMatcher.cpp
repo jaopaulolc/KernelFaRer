@@ -101,19 +101,21 @@ inline bind_val_and_ptr_op_ty<LoadInst, OpTy> m_LoadAndPtrOp(LoadInst *&Load,
 template <typename PtrTy, typename Idx1Ty,
           typename Idx2Ty = PatternMatch::is_zero>
 struct GEP_match {
+  GetElementPtrInst *&GEP;
   PtrTy Ptr;
   Idx1Ty Idx1;
   Idx2Ty Idx2;
   bool HasIdx2;
 
-  GEP_match(const PtrTy &Ptr, const Idx1Ty &Idx1)
-      : Ptr(Ptr), Idx1(Idx1), Idx2(m_Zero()), HasIdx2(false) {}
-  GEP_match(const PtrTy &Ptr, const Idx1Ty &Idx1, const Idx2Ty &Idx2)
-      : Ptr(Ptr), Idx1(Idx1), Idx2(Idx2), HasIdx2(true) {}
+  GEP_match(GetElementPtrInst *&GEP, const PtrTy &Ptr, const Idx1Ty &Idx1)
+      : GEP(GEP), Ptr(Ptr), Idx1(Idx1), Idx2(m_Zero()), HasIdx2(false) {}
+  GEP_match(GetElementPtrInst *&GEP, const PtrTy &Ptr, const Idx1Ty &Idx1, const Idx2Ty &Idx2)
+      : GEP(GEP),Ptr(Ptr), Idx1(Idx1), Idx2(Idx2), HasIdx2(true) {}
 
   template <typename OpTy> bool match(OpTy *V) {
     auto Matched = false;
     if (auto *I = dyn_cast<GetElementPtrInst>(V)) {
+      GEP = I;
       auto N = I->getNumOperands();
       if (N > 2)
         Matched = Ptr.match(I->getOperand(0)) &&
@@ -128,16 +130,16 @@ struct GEP_match {
 
 /// Matches GetElementPtrInst's PointerOperand and first Index value.
 template <typename PtrTy, typename IdxTy>
-inline GEP_match<PtrTy, IdxTy> m_GEP(PtrTy Ptr, IdxTy Idx) {
-  return GEP_match<PtrTy, IdxTy>(Ptr, Idx);
+inline GEP_match<PtrTy, IdxTy> m_GEP(GetElementPtrInst *&GEP, PtrTy Ptr, IdxTy Idx) {
+  return GEP_match<PtrTy, IdxTy>(GEP, Ptr, Idx);
 }
 
 /// Matches GetElementPtrInst's PointerOperand and both last and second last
 /// Index values.
 template <typename PtrTy, typename Idx1Ty, typename Idx2Ty>
-inline GEP_match<PtrTy, Idx1Ty, Idx2Ty> m_GEP(PtrTy Ptr, Idx1Ty Idx1,
+inline GEP_match<PtrTy, Idx1Ty, Idx2Ty> m_GEP(GetElementPtrInst *&GEP, PtrTy Ptr, Idx1Ty Idx1,
                                               Idx2Ty Idx2) {
-  return GEP_match<PtrTy, Idx1Ty, Idx2Ty>(Ptr, Idx1, Idx2);
+  return GEP_match<PtrTy, Idx1Ty, Idx2Ty>(GEP, Ptr, Idx1, Idx2);
 }
 
 // Base classs for m_OneOf matcher.
@@ -246,22 +248,25 @@ inline auto matchPHITimesLD(PHINode *&PHI, Value *&LD) {
 // dimension value of the array (LD). The returned matcher accounts for
 // different pattern of IR that are generated when accessing flat or 2D
 // arrays.
-inline auto match1Dor2DPtrOpAndInductionVariables(Value *&Op, PHINode *&PHI1,
+inline auto match1Dor2DPtrOpAndInductionVariables(GetElementPtrInst *&GEPInst,
+                                                  Value *&Op, PHINode *&PHI1,
                                                   PHINode *&PHI2, Value *&LD) {
+  // TODO: Make dummy GEPs optional
+  GetElementPtrInst *DummyGEP;
   return m_OneOf(
-      m_GEP(m_Load(m_GEP(m_Value(Op), m_PHI(PHI2))), m_PHI(PHI1)),
-      m_GEP(m_GEP(m_Value(Op), matchPHITimesLD(PHI1, LD)), m_PHI(PHI2)),
-      m_GEP(m_GEP(m_Value(Op), m_PHI(PHI2)), matchPHITimesLD(PHI1, LD)),
-      m_GEP(m_Value(Op), m_PHI(PHI1), m_PHI(PHI2)),
-      m_GEP(m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD)));
+      m_GEP(DummyGEP, m_Load(m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2))), m_PHI(PHI1)),
+      m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), matchPHITimesLD(PHI1, LD)), m_PHI(PHI2)),
+      m_GEP(DummyGEP, m_GEP(GEPInst, m_Value(Op), m_PHI(PHI2)), matchPHITimesLD(PHI1, LD)),
+      m_GEP(GEPInst, m_Value(Op), m_PHI(PHI1), m_PHI(PHI2)),
+      m_GEP(GEPInst, m_Value(Op), linearFunctionOfPHI(PHI1, PHI2, LD)));
 }
 
 // A helper function that returns a matcher of a load to flat or 2D array. The
 // returned matcher uses the match1Dor2DPtrOpAndInductionVariables helper
 // function's return as a sub-matcher.
-inline auto match1Dor2DLoadAndIndices(Value *&PtrOp, PHINode *&Idx1,
+inline auto match1Dor2DLoadAndIndices(GetElementPtrInst *&GEPInst, Value *&PtrOp, PHINode *&Idx1,
                                       PHINode *&Idx2, Value *&LD) {
-  return m_Load(match1Dor2DPtrOpAndInductionVariables(PtrOp, Idx1, Idx2, LD));
+  return m_Load(match1Dor2DPtrOpAndInductionVariables(GEPInst, PtrOp, Idx1, Idx2, LD));
 }
 
 template <typename MulLHSTy, typename MulRHSTy>
@@ -277,12 +282,14 @@ inline auto floatMultiplyWithScalar(MulLHSTy MulLHS, MulRHSTy MulRHS,
 // used as indexes into each array (IdxA1/2 & IdxB1/2) and, if part of the
 // indexing expression, the leading dimension of each array.
 // TODO: add support for types other than floating-point
-inline auto matchFMulFAddPattern(Value *&MulLHS, Value *&MulRHS,
+inline auto matchFMulFAddPattern(GetElementPtrInst *&GEPLHS,
+                                 GetElementPtrInst *&GEPRHS,
+                                 Value *&MulLHS, Value *&MulRHS,
                                  PHINode *&IdxA1, PHINode *&IdxA2,
                                  PHINode *&IdxB1, PHINode *&IdxB2, Value *&LDA,
                                  Value *&LDB, Value *&Alpha) {
-  auto LHS = match1Dor2DLoadAndIndices(MulLHS, IdxA1, IdxA2, LDA);
-  auto RHS = match1Dor2DLoadAndIndices(MulRHS, IdxB1, IdxB2, LDB);
+  auto LHS = match1Dor2DLoadAndIndices(GEPLHS, MulLHS, IdxA1, IdxA2, LDA);
+  auto RHS = match1Dor2DLoadAndIndices(GEPRHS, MulRHS, IdxB1, IdxB2, LDB);
   return m_OneOf(
       m_c_FAdd(m_Value(), floatMultiplyWithScalar(LHS, RHS, Alpha)),
       m_Intrinsic<Intrinsic::fmuladd>(scaledValueOrValue(LHS, Alpha), RHS),
@@ -293,7 +300,8 @@ inline auto matchFMulFAddPattern(Value *&MulLHS, Value *&MulRHS,
 // A helper function that returns a matcher of a store into a flat or 2D array
 // C of the result of a reduction pattern matched by ReductionMatcher.
 template <typename MatcherType>
-inline auto matchStoreOfMatrixC(MatcherType ReductionMatcher, Value *&C,
+inline auto matchStoreOfMatrixC(MatcherType ReductionMatcher,
+                                GetElementPtrInst *&GEPC, Value *&C,
                                 PHINode *&IdxC1, PHINode *&IdxC2, Value *&LDC,
                                 Value *&GEP, Value *&Alpha, Value *&Beta) {
   return m_Store(
@@ -304,7 +312,7 @@ inline auto matchStoreOfMatrixC(MatcherType ReductionMatcher, Value *&C,
                            m_CombineOr(m_PHI(m_Zero(), ReductionMatcher),
                                        ReductionMatcher),
                            Alpha))),
-      match1Dor2DPtrOpAndInductionVariables(C, IdxC1, IdxC2, LDC));
+      match1Dor2DPtrOpAndInductionVariables(GEPC, C, IdxC1, IdxC2, LDC));
 }
 
 // A helper function that returns a matcher of a store into a flat or 2D array
@@ -628,8 +636,10 @@ static bool matchSyr2kIndVarAndLayout(Value *const &PtrToA, Value *&PtrToA2,
 // SeedInst) are set to capture values in the IR that describe the
 // Matrix-Multiply.
 static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
-                      Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
-                      Value *&BasePtrToC, Value *&LDA, Value *&LDB, Value *&LDC,
+                      Value *&IVarK, GetElementPtrInst *&GEPA, Value *&BasePtrToA,
+                      GetElementPtrInst *&GEPB, Value *&BasePtrToB,
+                      GetElementPtrInst *&GEPC, Value *&BasePtrToC,
+                      Value *&LDA, Value *&LDB, Value *&LDC,
                       CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                       CBLAS_ORDER &CLayout, LoopInfo &LI, Value *&Alpha,
                       Value *&Beta, bool &IsCReduced) {
@@ -645,10 +655,11 @@ static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
   Value *MatchedGEP = nullptr;
 
   // MatMul matcher
-  auto ReductionMatcher = matchFMulFAddPattern(
+  auto ReductionMatcher = matchFMulFAddPattern(GEPA, GEPB,
       BasePtrToA, BasePtrToB, APHI1, APHI2, BPHI1, BPHI2, LDA, LDB, Alpha);
-  auto Matcher = matchStoreOfMatrixC(ReductionMatcher, BasePtrToC, CPHI1, CPHI2,
-                                     LDC, MatchedGEP, Alpha1, Beta);
+  auto Matcher = matchStoreOfMatrixC(ReductionMatcher, GEPC, BasePtrToC,
+                                     CPHI1, CPHI2, LDC, MatchedGEP,
+                                     Alpha1, Beta);
 
   bool IsGEMM = false;
   if (match(SeedInstAsValue, Matcher) && BasePtrToA != BasePtrToC &&
@@ -672,7 +683,9 @@ static bool matchGEMM(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
 }
 
 static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
-                       Value *&IVarK, Value *&BasePtrToA, Value *&BasePtrToB,
+                       Value *&IVarK, GetElementPtrInst *&GEPA,
+                       Value *&BasePtrToA, GetElementPtrInst *&GEPB,
+                       Value *&BasePtrToB, GetElementPtrInst *&GEPC,
                        Value *&BasePtrToC, Value *&LDA, Value *&LDB,
                        Value *&LDC, CBLAS_ORDER &ALayout, CBLAS_ORDER &BLayout,
                        CBLAS_ORDER &CLayout, Value *&Alpha, Value *&Beta,
@@ -684,7 +697,9 @@ static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
   SmallVector<PHINode *, 4> BPHI = {nullptr, nullptr, nullptr, nullptr};
   PHINode *CPHI1 = nullptr;
   PHINode *CPHI2 = nullptr;
+  GetElementPtrInst *GEPA2 = nullptr;
   Value *BasePtrToA2 = nullptr;
+  GetElementPtrInst *GEPB2 = nullptr;
   Value *BasePtrToB2 = nullptr;
   Value *LDA2 = nullptr;
   Value *LDB2 = nullptr;
@@ -694,16 +709,16 @@ static bool matchSYR2K(Instruction &SeedInst, Value *&IVarI, Value *&IVarJ,
   auto StoreMatcher = matchSYR2KStore(StoreToC, AddLHS, AddRHS);
 
   auto AddLHSMatcher = floatMultiplyWithScalar(
-      match1Dor2DLoadAndIndices(BasePtrToA, APHI[0], APHI[1], LDA),
-      match1Dor2DLoadAndIndices(BasePtrToB, BPHI[0], BPHI[1], LDB), Alpha);
+      match1Dor2DLoadAndIndices(GEPA, BasePtrToA, APHI[0], APHI[1], LDA),
+      match1Dor2DLoadAndIndices(GEPB, BasePtrToB, BPHI[0], BPHI[1], LDB), Alpha);
 
   auto AddRHSMatcher = floatMultiplyWithScalar(
-      match1Dor2DLoadAndIndices(BasePtrToA2, APHI[2], APHI[3], LDA2),
-      match1Dor2DLoadAndIndices(BasePtrToB2, BPHI[2], BPHI[3], LDB2), Alpha1);
+      match1Dor2DLoadAndIndices(GEPA2, BasePtrToA2, APHI[2], APHI[3], LDA2),
+      match1Dor2DLoadAndIndices(GEPA2, BasePtrToB2, BPHI[2], BPHI[3], LDB2), Alpha1);
 
   bool IsSYR2K = false;
   if (match(SeedInstAsValue, StoreMatcher) &&
-      match(StoreToC, match1Dor2DPtrOpAndInductionVariables(BasePtrToC, CPHI1,
+      match(StoreToC, match1Dor2DPtrOpAndInductionVariables(GEPC, BasePtrToC, CPHI1,
                                                             CPHI2, LDC)) &&
       match(AddLHS, AddLHSMatcher) &&
       matchMatrixLayout(APHI[0], APHI[1], BPHI[0], BPHI[1], CPHI1, CPHI2,
@@ -739,7 +754,8 @@ void setLeadingDimensionValue(BasicBlock &FunEntryBB, Loop &L,
 // to matrix C, which has base address \p C, in the effective address computed
 // with \p LDC, IVarI, and IVarJ that are within loop \p L.
 static void collectOtherKernelStoresToC(
-    const Value *C, const Value *LDC, const Value *IVarI, const Value *IVarJ,
+    const GetElementPtrInst *GEPC, const Value *C, const Value *LDC,
+    const Value *IVarI, const Value *IVarJ,
     const Value *Alpha, const Value *Beta, const Loop *L,
     const Instruction &ReductionStore, DominatorTree &DT,
     SmallSetVector<const Value *, 2> &Stores, bool &IsCReduced) {
@@ -754,14 +770,15 @@ static void collectOtherKernelStoresToC(
         PHINode *PHI2 = nullptr;
         Value *Alpha1 = nullptr;
         Value *Beta1 = nullptr;
+        GetElementPtrInst *GEPC1 = nullptr;
         Value *GEP = Inst->getOperand(1);
         auto StoreMatcher = m_Store(
             m_OneOf(m_Constant(), scaledValueOrValue(m_Zero(), Alpha1),
                     scaledValueOrValue(m_Load(m_Specific(GEP)), Beta1),
                     m_c_FAdd(scaledValueOrValue(m_Load(m_Specific(GEP)), Beta1),
                              scaledValueOrValue(m_Zero(), Alpha1))),
-            match1Dor2DPtrOpAndInductionVariables(C1, PHI1, PHI2, LDC1));
-        if (match(InstAsValue, StoreMatcher) && C == C1 &&
+            match1Dor2DPtrOpAndInductionVariables(GEPC1, C1, PHI1, PHI2, LDC1));
+        if (match(InstAsValue, StoreMatcher) && GEPC == GEPC1 && C == C1 &&
             (LDC1 == nullptr || LDC1 == LDC) &&
             ((Alpha == nullptr || Alpha1 == nullptr) || Alpha == Alpha1) &&
             ((Beta == nullptr || Beta1 == nullptr) || Beta == Beta1) &&
@@ -792,8 +809,11 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
       for (auto Inst = BB->begin(); Inst != BB->end(); Inst++) {
         if (!isa<StoreInst>(Inst))
           continue;
+        GetElementPtrInst *GEPA = nullptr;
         Value *BasePtrToA = nullptr;
+        GetElementPtrInst *GEPB = nullptr;
         Value *BasePtrToB = nullptr;
+        GetElementPtrInst *GEPC = nullptr;
         Value *BasePtrToC = nullptr;
         Value *IVarI = nullptr;
         Value *IVarJ = nullptr;
@@ -816,16 +836,17 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
 
         // Check that the loops for this store intstruction match the
         // Syr2k pattern
-        if (matchSYR2K(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
-                       BasePtrToC, LDA, LDB, LDC, ALayout, BLayout, CLayout,
-                       Alpha, Beta, LI) &&
+        if (matchSYR2K(*Inst, IVarI, IVarJ, IVarK, GEPA, BasePtrToA,
+                       GEPB, BasePtrToB, GEPC, BasePtrToC, LDA, LDB, LDC,
+                       ALayout, BLayout, CLayout, Alpha, Beta, LI) &&
             matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
             matchLoopUpperBound(LI, static_cast<PHINode *>(IVarK), K)) {
           KT = Kernel::KernelType::SYR2K_KERNEL;
           // Check that the loops for this store intstruction match the
           // Matrix-Multiply pattern
-        } else if (matchGEMM(*Inst, IVarI, IVarJ, IVarK, BasePtrToA, BasePtrToB,
-                             BasePtrToC, LDA, LDB, LDC, ALayout, BLayout,
+        } else if (matchGEMM(*Inst, IVarI, IVarJ, IVarK, GEPA, BasePtrToA,
+                             GEPB, BasePtrToB, GEPC, BasePtrToC,
+                             LDA, LDB, LDC, ALayout, BLayout,
                              CLayout, LI, Alpha, Beta, IsCReduced) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarI), M) &&
                    matchLoopUpperBound(LI, static_cast<PHINode *>(IVarJ), N) &&
@@ -853,9 +874,15 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
         Value *MatchedLDC = LDC;
 
         Stores.insert(&*Inst);
-        collectOtherKernelStoresToC(BasePtrToC, MatchedLDC, IVarI, IVarJ, Alpha,
+        collectOtherKernelStoresToC(GEPC, BasePtrToC, MatchedLDC, IVarI, IVarJ, Alpha,
                                     Beta, OuterLoop, *Inst, DT, Stores, IsCReduced);
 
+        assert(GEPA && "No GetElementPtrInst match for matrix A!");
+        Type *AElType = GEPA->getSourceElementType();
+        assert(GEPB && "No GetElementPtrInst match for matrix B!");
+        Type *BElType = GEPB->getSourceElementType();
+        assert(GEPC && "No GetElementPtrInst match for matrix C!");
+        Type *CElType = GEPC->getSourceElementType();
         if (KT == Kernel::KernelType::SYR2K_KERNEL) {
           // Note that LD* is determined first by the overall storage order
           // then whether or not the matrix has been transposed.
@@ -871,9 +898,9 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
             LDC = N;
 
           // Matrices constructed from matched values and deduced layouts.
-          Matrix MatrixA(*BasePtrToA, ALayout, *LDA, *N, *K, *IVarI, *IVarK);
-          Matrix MatrixB(*BasePtrToB, BLayout, *LDB, *N, *K, *IVarI, *IVarK);
-          Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *N, *N, *IVarI, *IVarJ);
+          Matrix MatrixA(*AElType, *BasePtrToA, ALayout, *LDA, *N, *K, *IVarI, *IVarK);
+          Matrix MatrixB(*BElType, *BasePtrToB, BLayout, *LDB, *N, *K, *IVarI, *IVarK);
+          Matrix MatrixC(*CElType, *BasePtrToC, CLayout, *LDC, *N, *N, *IVarI, *IVarJ);
           ListOfKernels->push_back(
               std::make_unique<SYR2K>(*OuterLoop, *Inst, MatrixA, MatrixB,
                                       MatrixC, Stores, Alpha, Beta));
@@ -911,9 +938,9 @@ GEMMMatcher::Result GEMMMatcher::run(Function &F, LoopInfo &LI,
           }
 
           // Matrices constructed from matched values and deduced layouts.
-          Matrix MatrixA(*BasePtrToA, ALayout, *LDA, *M, *K, *IVarI, *IVarK);
-          Matrix MatrixB(*BasePtrToB, BLayout, *LDB, *K, *N, *IVarK, *IVarJ);
-          Matrix MatrixC(*BasePtrToC, CLayout, *LDC, *M, *N, *IVarI, *IVarJ);
+          Matrix MatrixA(*AElType, *BasePtrToA, ALayout, *LDA, *M, *K, *IVarI, *IVarK);
+          Matrix MatrixB(*BElType, *BasePtrToB, BLayout, *LDB, *K, *N, *IVarK, *IVarJ);
+          Matrix MatrixC(*CElType, *BasePtrToC, CLayout, *LDC, *M, *N, *IVarI, *IVarJ);
           ListOfKernels->push_back(
               std::make_unique<GEMM>(*OuterLoop, *Inst, MatrixA, MatrixB,
                                      MatrixC, Stores, IsCReduced, Alpha, Beta));

@@ -107,23 +107,6 @@ void storeFlatVectorMatrix(MatrixBuilder &MBuilder, Value &Matrix,
         RowsAsUInt64);
 }
 
-/// A helper function to retrieve the scalar type of a value pointer.
-///
-/// \param M a value pointer to a scalar type or a 2D array of scalar values
-///
-/// \returns the scalar type of a value pointer to 2D array or scalar pointed by
-/// \p M.
-Type *getMatrixElementType(const Value &M) {
-  auto *ElementType = M.getType()->getPointerElementType();
-  if (ElementType->isArrayTy()) {
-    ElementType = ElementType->getArrayElementType();
-    if (ElementType->isArrayTy())
-      ElementType = ElementType->getArrayElementType();
-  }
-  assert(ElementType->isIntegerTy() || ElementType->isFloatingPointTy());
-  return ElementType;
-}
-
 /// A helper function that Down-/uppercasts integer value to Int32
 ///
 /// \param V a Value pointer to an integer type
@@ -184,13 +167,13 @@ auto *prepEigenInt64(IRBuilder<> &IR, Value *const &V) {
 auto *getFlatPointerToMatrix(IRBuilder<> &IR, const GEMMFaRer::Matrix &M) {
   // Flatten array
   auto *BasePtr = &M.getBaseAddressPointer();
-  auto *DestTy = getMatrixElementType(*BasePtr)->getPointerTo();
+  auto *DestTy = M.getScalarElementType()->getPointerTo();
   BasePtr = IR.CreateBitCast(BasePtr, DestTy);
 
   // If we have a pointer to a vector (e.g. [1024 x double]*) it is safe to
   // convert it to a pointer to the base type. We cast away explicit size
   // info but BLAS doesn't care.
-  if (auto *MATy = dyn_cast<ArrayType>(getMatrixElementType(*BasePtr)))
+  if (auto *MATy = dyn_cast<ArrayType>(M.getScalarElementType()))
     BasePtr = IR.CreatePointerCast(BasePtr,
                                    MATy->getArrayElementType()->getPointerTo());
   return BasePtr;
@@ -246,7 +229,7 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
   auto *LDC = prepBLASInt32(IR, &MC.getLeadingDimensionSize(), Downcast);
 
   // C's pointed to type defines the operation type.
-  auto *OpTy = getMatrixElementType(*C);
+  auto *OpTy = MC.getScalarElementType();
 
   // Make args for alpha/beta.
   Value *Alpha = prepBLASScalar(IR, Gemm.getAlpha(), OpTy);
@@ -254,8 +237,8 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
       prepBLASScalar(IR, Gemm.getBeta(), OpTy, Gemm.IsCReduced() ? 1.0 : 0.0);
 
   // Sanity type checking.
-  assert(getMatrixElementType(*A) == OpTy && "A and C are typed differently.");
-  assert(getMatrixElementType(*B) == OpTy && "B and C are typed differently.");
+  assert(MA.getScalarElementType() == OpTy && "A and C are typed differently.");
+  assert(MB.getScalarElementType() == OpTy && "B and C are typed differently.");
   assert(Alpha->getType() == OpTy && "Alpha and C are typed differently.");
   assert(Beta->getType() == OpTy && "Beta and C are typed differently.");
 
@@ -302,7 +285,7 @@ void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
   auto *C = getFlatPointerToMatrix(IR, MC);
 
   // C's pointed to type defines the operation type.
-  Type *opTy = getMatrixElementType(*C);
+  Type *opTy = MC.getScalarElementType();
 
   // Make args for LDA, LDB, LDC
   auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
@@ -319,8 +302,8 @@ void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
   auto *Beta = prepBLASScalar(IR, Syr2k.getBeta(), opTy, BetaInit);
 
   // Sanity type checking.
-  assert(getMatrixElementType(*A) == opTy && "A and C are typed differently.");
-  assert(getMatrixElementType(*B) == opTy && "B and C are typed differently.");
+  assert(MA.getScalarElementType() == opTy && "A and C are typed differently.");
+  assert(MB.getScalarElementType() == opTy && "B and C are typed differently.");
   assert(Alpha->getType() == opTy && "Alpha and C are typed differently.");
   assert(Beta->getType() == opTy && "Beta and C are typed differently.");
 
@@ -351,9 +334,9 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
   auto &C = MC.getBaseAddressPointer();
 
   // Matrix elements type checks
-  auto *AElType = getMatrixElementType(A);
-  auto *BElType = getMatrixElementType(B);
-  auto *CElType = getMatrixElementType(C);
+  auto *AElType = MA.getScalarElementType();
+  auto *BElType = MB.getScalarElementType();
+  auto *CElType = MC.getScalarElementType();
   assert(AElType == CElType && "A and C are typed differently.");
   assert(BElType == CElType && "B and C are typed differently.");
 
@@ -441,15 +424,15 @@ void buildEigenCall(Module &Mod, IRBuilder<> &IR, const GEMMFaRer::GEMM &Gemm) {
   auto *C = getFlatPointerToMatrix(IR, MC);
 
   // C's pointed to type defines the operation type.
-  Type *OpTy = getMatrixElementType(*C);
+  Type *OpTy = MC.getScalarElementType();
 
   // Make args for alpha/beta.
   Value *Alpha = Gemm.getAlpha();
   Value *Beta = Gemm.getBeta();
 
   // Sanity type checking.
-  assert(getMatrixElementType(*A) == OpTy && "A and C are typed differently.");
-  assert(getMatrixElementType(*B) == OpTy && "B and C are typed differently.");
+  assert(MA.getScalarElementType() == OpTy && "A and C are typed differently.");
+  assert(MB.getScalarElementType() == OpTy && "B and C are typed differently.");
 
   // Add args and types for A, B, C.
   Args.emplace_back(A);
@@ -553,9 +536,9 @@ bool runImpl(Function &F, GEMMMatcher::Result &GMPR) {
     Loop &L = Ker->getAssociatedLoop();
 
     // We can't transform two dimensional pointers.
-    auto *ATy = Ker->getMatrixA().getBaseAddressPointer().getType();
-    auto *BTy = Ker->getMatrixB().getBaseAddressPointer().getType();
-    auto *CTy = Ker->getMatrixC().getBaseAddressPointer().getType();
+    auto *ATy = Ker->getMatrixA().getScalarElementType();
+    auto *BTy = Ker->getMatrixB().getScalarElementType();
+    auto *CTy = Ker->getMatrixC().getScalarElementType();
     if (ATy->isPointerTy() && ATy->getPointerElementType()->isPointerTy()) {
       LLVM_DEBUG(dbgs() << "Matrix A was two dimensional pointer.\n");
       return false;

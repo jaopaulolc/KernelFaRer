@@ -53,6 +53,7 @@ enum CBLAS_SIDE { Left = 141, Right = 142 };
 
 /// Class that represents a matrix extracted from GEMM
 class Matrix {
+  Type &EltType;
   Value &BaseAddressPointer;   ///< pointer to the array of matrix elements
   CBLAS_ORDER Layout;          ///< layout of matrix elements in the array
   Value &LeadingDimensionSize; ///< number of elements between two consecutive
@@ -64,13 +65,24 @@ class Matrix {
   Value &ColumnIV;             ///< induction variable to access columns
 
 public:
-  Matrix(Value &BaseAddressPointer, CBLAS_ORDER Layout,
+  Matrix(Type &EltType, Value &BaseAddressPointer, CBLAS_ORDER Layout,
          Value &LeadingDimensionSize, Value &Rows, Value &Columns, Value &RowIV,
          Value &ColumnIV)
-      : BaseAddressPointer(BaseAddressPointer), Layout(Layout),
-        LeadingDimensionSize(LeadingDimensionSize), Rows(Rows),
+      : EltType(EltType), BaseAddressPointer(BaseAddressPointer),
+        Layout(Layout), LeadingDimensionSize(LeadingDimensionSize), Rows(Rows),
         Columns(Columns), RowIV(RowIV), ColumnIV(ColumnIV) {}
 
+  Type &getElementType() const { return EltType; }
+  Type *getScalarElementType() const {
+    Type *ElementType = &EltType;
+    if (ElementType->isArrayTy()) {
+      ElementType = ElementType->getArrayElementType();
+      if (ElementType->isArrayTy())
+        ElementType = ElementType->getArrayElementType();
+    }
+    assert(ElementType->isIntegerTy() || ElementType->isFloatingPointTy());
+    return ElementType;
+  }
   Value &getBaseAddressPointer() const { return BaseAddressPointer; }
   CBLAS_ORDER getLayout() const { return Layout; }
   Value &getLeadingDimensionSize() const { return LeadingDimensionSize; }

@@ -1009,6 +1009,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(BDCEPass()));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopInstSimplifyPass())));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopSimplifyCFGPass())));
     MPM.addPass(createModuleToFunctionPassAdaptor(GEMMReplacerPass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LoopDeletionPass())));
     MPM.addPass(createModuleToFunctionPassAdaptor(BDCEPass()));

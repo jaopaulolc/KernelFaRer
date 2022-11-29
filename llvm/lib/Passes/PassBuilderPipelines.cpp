@@ -998,7 +998,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
     MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(ReassociatePass()));
-    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,/*AllowSpeculation*/true))));
+    MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(LICMPass(PTO.LicmMssaOptCap, PTO.LicmMssaNoAccForPromotionCap,/*AllowSpeculation*/true),/*UseMemorySSA=*/true, /*UseBlockFrequencyInfo=*/true)));
     MPM.addPass(createModuleToFunctionPassAdaptor(createFunctionToLoopPassAdaptor(SimpleLoopUnswitchPass())));
     MPM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
     MPM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));

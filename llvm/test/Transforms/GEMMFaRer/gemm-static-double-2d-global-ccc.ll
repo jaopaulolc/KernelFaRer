@@ -8,18 +8,18 @@
 define void @_Z14staticSizeGEMMdd(double %alpha, double %beta) {
 ; CHECK-LABEL: @_Z14staticSizeGEMMdd(
 ; CHECK-NEXT:  entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = call <1024 x double> @llvm.matrix.column.major.load.v1024f64.i64(double* align 8 getelementptr inbounds ([64 x [16 x double]], [64 x [16 x double]]* @A, i32 0, i32 0, i32 0), i64 16, i1 false, i32 16, i32 64)
-; CHECK-NEXT:    [[TMP1:%.*]] = call <512 x double> @llvm.matrix.column.major.load.v512f64.i64(double* align 8 getelementptr inbounds ([8 x [64 x double]], [8 x [64 x double]]* @B, i32 0, i32 0, i32 0), i64 64, i1 false, i32 64, i32 8)
+; CHECK-NEXT:    [[TMP0:%.*]] = call <1024 x double> @llvm.matrix.column.major.load.v1024f64.i64(ptr align 8 @A, i64 16, i1 false, i32 16, i32 64)
+; CHECK-NEXT:    [[TMP1:%.*]] = call <512 x double> @llvm.matrix.column.major.load.v512f64.i64(ptr align 8 @B, i64 64, i1 false, i32 64, i32 8)
 ; CHECK-NEXT:    [[TMP2:%.*]] = call <128 x double> @llvm.matrix.multiply.v128f64.v1024f64.v512f64(<1024 x double> [[TMP0]], <512 x double> [[TMP1]], i32 16, i32 64, i32 8)
 ; CHECK-NEXT:    [[SCALAR_SPLAT_SPLATINSERT:%.*]] = insertelement <128 x double> poison, double [[ALPHA:%.*]], i32 0
 ; CHECK-NEXT:    [[SCALAR_SPLAT_SPLAT:%.*]] = shufflevector <128 x double> [[SCALAR_SPLAT_SPLATINSERT]], <128 x double> poison, <128 x i32> zeroinitializer
 ; CHECK-NEXT:    [[TMP3:%.*]] = fmul <128 x double> [[SCALAR_SPLAT_SPLAT]], [[TMP2]]
-; CHECK-NEXT:    [[TMP4:%.*]] = call <128 x double> @llvm.matrix.column.major.load.v128f64.i64(double* align 8 getelementptr inbounds ([8 x [16 x double]], [8 x [16 x double]]* @C, i32 0, i32 0, i32 0), i64 16, i1 false, i32 16, i32 8)
+; CHECK-NEXT:    [[TMP4:%.*]] = call <128 x double> @llvm.matrix.column.major.load.v128f64.i64(ptr align 8 @C, i64 16, i1 false, i32 16, i32 8)
 ; CHECK-NEXT:    [[SCALAR_SPLAT_SPLATINSERT1:%.*]] = insertelement <128 x double> poison, double [[BETA:%.*]], i32 0
 ; CHECK-NEXT:    [[SCALAR_SPLAT_SPLAT2:%.*]] = shufflevector <128 x double> [[SCALAR_SPLAT_SPLATINSERT1]], <128 x double> poison, <128 x i32> zeroinitializer
 ; CHECK-NEXT:    [[TMP5:%.*]] = fmul <128 x double> [[SCALAR_SPLAT_SPLAT2]], [[TMP4]]
 ; CHECK-NEXT:    [[TMP6:%.*]] = fadd <128 x double> [[TMP3]], [[TMP5]]
-; CHECK-NEXT:    call void @llvm.matrix.column.major.store.v128f64.i64(<128 x double> [[TMP6]], double* align 8 getelementptr inbounds ([8 x [16 x double]], [8 x [16 x double]]* @C, i32 0, i32 0, i32 0), i64 16, i1 false, i32 16, i32 8)
+; CHECK-NEXT:    call void @llvm.matrix.column.major.store.v128f64.i64(<128 x double> [[TMP6]], ptr align 8 @C, i64 16, i1 false, i32 16, i32 8)
 ; CHECK-NEXT:    ret void
 ;
 entry:
@@ -43,11 +43,11 @@ for.cond.cleanup3:                                ; preds = %for.cond.cleanup7
 
 for.cond.cleanup7:                                ; preds = %for.body8
   %mul15 = fmul double %add, %alpha
-  %arrayidx19 = getelementptr inbounds [8 x [16 x double]], [8 x [16 x double]]* @C, i64 0, i64 %indvars.iv54, i64 %indvars.iv57
-  %0 = load double, double* %arrayidx19, align 8
+  %arrayidx19 = getelementptr inbounds [8 x [16 x double]], ptr @C, i64 0, i64 %indvars.iv54, i64 %indvars.iv57
+  %0 = load double, ptr %arrayidx19, align 8
   %mul20 = fmul double %0, %beta
   %add21 = fadd double %mul15, %mul20
-  store double %add21, double* %arrayidx19, align 8
+  store double %add21, ptr %arrayidx19, align 8
   %indvars.iv.next55 = add nuw nsw i64 %indvars.iv54, 1
   %exitcond56.not = icmp eq i64 %indvars.iv.next55, 8
   br i1 %exitcond56.not, label %for.cond.cleanup3, label %for.cond5.preheader
@@ -55,10 +55,10 @@ for.cond.cleanup7:                                ; preds = %for.body8
 for.body8:                                        ; preds = %for.cond5.preheader, %for.body8
   %indvars.iv = phi i64 [ 0, %for.cond5.preheader ], [ %indvars.iv.next, %for.body8 ]
   %c.050 = phi double [ 0.000000e+00, %for.cond5.preheader ], [ %add, %for.body8 ]
-  %arrayidx10 = getelementptr inbounds [64 x [16 x double]], [64 x [16 x double]]* @A, i64 0, i64 %indvars.iv, i64 %indvars.iv57
-  %1 = load double, double* %arrayidx10, align 8
-  %arrayidx14 = getelementptr inbounds [8 x [64 x double]], [8 x [64 x double]]* @B, i64 0, i64 %indvars.iv54, i64 %indvars.iv
-  %2 = load double, double* %arrayidx14, align 8
+  %arrayidx10 = getelementptr inbounds [64 x [16 x double]], ptr @A, i64 0, i64 %indvars.iv, i64 %indvars.iv57
+  %1 = load double, ptr %arrayidx10, align 8
+  %arrayidx14 = getelementptr inbounds [8 x [64 x double]], ptr @B, i64 0, i64 %indvars.iv54, i64 %indvars.iv
+  %2 = load double, ptr %arrayidx14, align 8
   %mul = fmul double %1, %2
   %add = fadd double %c.050, %mul
   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1

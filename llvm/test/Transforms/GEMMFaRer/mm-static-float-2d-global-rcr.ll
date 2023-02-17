@@ -8,12 +8,12 @@
 define void @_Z11fixedSizeMMv() {
 ; CHECK-LABEL: @_Z11fixedSizeMMv(
 ; CHECK-NEXT:  entry:
-; CHECK-NEXT:    [[TMP0:%.*]] = call <1024 x float> @llvm.matrix.column.major.load.v1024f32.i64(float* align 4 getelementptr inbounds ([16 x [64 x float]], [16 x [64 x float]]* @A, i32 0, i32 0, i32 0), i64 64, i1 false, i32 64, i32 16)
+; CHECK-NEXT:    [[TMP0:%.*]] = call <1024 x float> @llvm.matrix.column.major.load.v1024f32.i64(ptr align 4 @A, i64 64, i1 false, i32 64, i32 16)
 ; CHECK-NEXT:    [[TMP1:%.*]] = call <1024 x float> @llvm.matrix.transpose.v1024f32(<1024 x float> [[TMP0]], i32 64, i32 16)
-; CHECK-NEXT:    [[TMP2:%.*]] = call <512 x float> @llvm.matrix.column.major.load.v512f32.i64(float* align 4 getelementptr inbounds ([8 x [64 x float]], [8 x [64 x float]]* @B, i32 0, i32 0, i32 0), i64 64, i1 false, i32 64, i32 8)
+; CHECK-NEXT:    [[TMP2:%.*]] = call <512 x float> @llvm.matrix.column.major.load.v512f32.i64(ptr align 4 @B, i64 64, i1 false, i32 64, i32 8)
 ; CHECK-NEXT:    [[TMP3:%.*]] = call <128 x float> @llvm.matrix.multiply.v128f32.v1024f32.v512f32(<1024 x float> [[TMP1]], <512 x float> [[TMP2]], i32 16, i32 64, i32 8)
 ; CHECK-NEXT:    [[TMP4:%.*]] = call <128 x float> @llvm.matrix.transpose.v128f32(<128 x float> [[TMP3]], i32 16, i32 8)
-; CHECK-NEXT:    call void @llvm.matrix.column.major.store.v128f32.i64(<128 x float> [[TMP4]], float* align 4 getelementptr inbounds ([16 x [8 x float]], [16 x [8 x float]]* @C, i32 0, i32 0, i32 0), i64 8, i1 false, i32 8, i32 16)
+; CHECK-NEXT:    call void @llvm.matrix.column.major.store.v128f32.i64(<128 x float> [[TMP4]], ptr align 4 @C, i64 8, i1 false, i32 8, i32 16)
 ; CHECK-NEXT:    ret void
 ;
 entry:
@@ -36,8 +36,8 @@ for.cond.cleanup3:                                ; preds = %for.cond.cleanup7
   br i1 %exitcond50.not, label %for.cond.cleanup, label %for.cond1.preheader
 
 for.cond.cleanup7:                                ; preds = %for.body8
-  %arrayidx18 = getelementptr inbounds [16 x [8 x float]], [16 x [8 x float]]* @C, i64 0, i64 %indvars.iv48, i64 %indvars.iv45
-  store float %add, float* %arrayidx18, align 4
+  %arrayidx18 = getelementptr inbounds [16 x [8 x float]], ptr @C, i64 0, i64 %indvars.iv48, i64 %indvars.iv45
+  store float %add, ptr %arrayidx18, align 4
   %indvars.iv.next46 = add nuw nsw i64 %indvars.iv45, 1
   %exitcond47.not = icmp eq i64 %indvars.iv.next46, 8
   br i1 %exitcond47.not, label %for.cond.cleanup3, label %for.cond5.preheader
@@ -45,10 +45,10 @@ for.cond.cleanup7:                                ; preds = %for.body8
 for.body8:                                        ; preds = %for.cond5.preheader, %for.body8
   %indvars.iv = phi i64 [ 0, %for.cond5.preheader ], [ %indvars.iv.next, %for.body8 ]
   %c.041 = phi float [ 0.000000e+00, %for.cond5.preheader ], [ %add, %for.body8 ]
-  %arrayidx10 = getelementptr inbounds [16 x [64 x float]], [16 x [64 x float]]* @A, i64 0, i64 %indvars.iv48, i64 %indvars.iv
-  %0 = load float, float* %arrayidx10, align 4
-  %arrayidx14 = getelementptr inbounds [8 x [64 x float]], [8 x [64 x float]]* @B, i64 0, i64 %indvars.iv45, i64 %indvars.iv
-  %1 = load float, float* %arrayidx14, align 4
+  %arrayidx10 = getelementptr inbounds [16 x [64 x float]], ptr @A, i64 0, i64 %indvars.iv48, i64 %indvars.iv
+  %0 = load float, ptr %arrayidx10, align 4
+  %arrayidx14 = getelementptr inbounds [8 x [64 x float]], ptr @B, i64 0, i64 %indvars.iv45, i64 %indvars.iv
+  %1 = load float, ptr %arrayidx14, align 4
   %mul = fmul float %0, %1
   %add = fadd float %c.041, %mul
   %indvars.iv.next = add nuw nsw i64 %indvars.iv, 1

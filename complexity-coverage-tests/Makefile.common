@@ -1,0 +1,85 @@
+CLANGPLUS ?= clang++
+COMPILER = $(CLANGPLUS)
+
+COMPILERFLAGS = -Wall -O3 -ffp-contract=fast -ffast-math -fopenmp -DDISABLE_VERIFY
+LDFLAGS = -Wl,--as-needed
+
+ARCH = $(shell uname -m)
+ifeq ($(ARCH), ppc64le)
+  COMPILERFLAGS += -mcpu=native -mtune=native
+else
+  ifeq ($(ARCH), x86_64)
+    COMPILERFLAGS += -march=native -mtune=native
+  endif
+endif
+
+ifneq ($(GEMMMODE),)
+  COMPILERFLAGS += -mllvm --enable-kernel-replacer
+  MODE := cblas-interface
+  ifeq ($(GEMMMODE),eigen)
+    MODE=eigen-runtime
+    COMPILERFLAGS += -fopenmp
+    LDFLAGS += -fopenmp -leigen-runtime
+  endif
+  ifeq ($(GEMMMODE),blas)
+    CPPFLAGS += -DWARMUP -DBLAS
+    LDFLAGS += -fopenmp -lopenblas
+  endif
+  ifeq ($(GEMMMODE),blis)
+    CPPFLAGS += -DWARMUP -DBLIS
+    LDFLAGS += -fopenmp -lblis-mt
+  endif
+  ifeq ($(GEMMMODE),mkl)
+    CPPFLAGS += -DWARMUP -DMKL
+    LDFLAGS += -lmkl_intel_ilp64 -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm -ldl
+  endif
+  ifeq ($(GEMMMODE),essl)
+    CPPFLAGS += -DWARMUP -DESSL
+    LDFLAGS += -fopenmp -lesslsmp
+  endif
+  COMPILERFLAGS += -mllvm --gemmfarer-replacement-mode=$(MODE)
+else
+  LDFLAGS += -fopenmp
+  # WARNING: Most polly flags are non-portable!
+  # Latency  and thoughput values for AMD and Intel are from Agner Fog's
+  # Instruction Tables https://www.agner.org/optimize/
+  # PowerPC values are from Table A-1 in the "Power9 Processor User's Manual".
+  ifeq ($(BUILD),POLLY)
+    COMPILERFLAGS += -mllvm -polly -mllvm -polly-pattern-matching-based-opts=true \
+                -mllvm -polly -mllvm -polly-parallel \
+			    -mllvm -polly-target-1st-cache-level-associativity=$(L1D_ASSOC) \
+			    -mllvm -polly-target-2nd-cache-level-associativity=$(L2_ASSOC) \
+			    -mllvm -polly-target-1st-cache-level-size=$(L1D_SIZE) \
+			    -mllvm -polly-target-2nd-cache-level-size=$(L2_SIZE)
+    ARCH = $(shell uname -m)
+    ifeq ($(ARCH), ppc64le)
+      COMPILERFLAGS += -mllvm -polly-target-latency-vector-fma=7 \
+                  -mllvm -polly-target-throughput-vector-fma=2
+    else
+      ifeq ($(ARCH), x86_64)
+        VENDORID = $(shell lscpu | grep 'Vendor ID' | sed 's|\s||g' | cut -d: -f2)
+        ifeq ($(VENDORID), AuthenticAMD)
+		  COMPILERFLAGS += -mllvm -polly-target-latency-vector-fma=5 \
+                      -mllvm -polly-target-throughput-vector-fma=2
+        else
+          ifeq ($(VENDORID), GenuineIntel)
+			COMPILERFLAGS += -mllvm -polly-target-latency-vector-fma=4 \
+                        -mllvm -polly-target-throughput-vector-fma=2
+          else
+            $(error "Unknown "$(ARCH)" vendor id: "$(VENDORID))
+          endif # if VENDORID Intel
+        endif # if VENDORID AMD
+      else
+        $(error "Unknown architecture "$(ARCH)".")
+      endif # if ARCH x86_64
+    endif # if ARCH ppc64le
+  endif # if POLLY
+endif
+
+all: $(KERNEL).$(BUILD)
+
+$(KERNEL).$(BUILD): tests.cpp
+	$(COMPILER) $(CPPFLAGS) -DRUN$(KERNEL) $(COMPILERFLAGS) $^ -o $@ $(LDFLAGS)
+
+clean:
+	$(RM) $(KERNEL).*

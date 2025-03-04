@@ -1,4 +1,4 @@
-CLANGPLUS ?= clang++-19
+CLANGPLUS ?= clang++
 
 PLUGIN ?= ../build/passes/KernelFaRer.so
 PASS = kernel-replacer-pass

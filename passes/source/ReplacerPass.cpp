@@ -589,6 +589,15 @@ PreservedAnalyses KernelReplacerPass::run(Function &F,
 }
 
 static void registerPasses(PassBuilder &PB) {
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, FunctionPassManager &FPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name == "kernel-replacer-pass") {
+          FPM.addPass(KernelReplacerPass());
+          return true;
+        }
+        return false;
+      });
   PB.registerVectorizerStartEPCallback(
       [](FunctionPassManager &FPM, OptimizationLevel Level) {
         FPM.addPass(KernelReplacerPass());

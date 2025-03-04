@@ -17,7 +17,18 @@ KernelFaRer $ cmake --build build
 
 For examples, please see [C++ examples](cplus-tests)
 
+## Unit tests
+
+Make sure you have lit installed.
+~~~bash
+$ pip install lit
+~~~
+
+Then use the helper script to run unit tests:
+~~~bash
+$ ./scripts/kernelfarer-lit ./lit-tests
+~~~
+
 ## TODOs:
 
 - Enable recognition in the presence of `llvm.fmuladd.*`
-- Add the ability to run lit tests

@@ -1,4 +1,6 @@
 CLANGPLUS ?= clang++
+PLUGIN ?= ../build/passes/KernelFaRer.so
+PASS ?= kernel-replacer-pass
 COMPILER = $(CLANGPLUS)
 
 COMPILERFLAGS = -Wall -O3 -ffp-contract=fast -ffast-math -fopenmp -DDISABLE_VERIFY
@@ -14,7 +16,7 @@ else
 endif
 
 ifneq ($(GEMMMODE),)
-  COMPILERFLAGS += -mllvm --enable-kernel-replacer
+  COMPILERFLAGS += -fplugin=$(PLUGIN) -fpass-plugin=$(PLUGIN) -Rpass-analysis=$(PASS) -Rpass-missed=$(PASS)
   MODE := cblas-interface
   ifeq ($(GEMMMODE),eigen)
     MODE=eigen-runtime
@@ -37,7 +39,7 @@ ifneq ($(GEMMMODE),)
     CPPFLAGS += -DWARMUP -DESSL
     LDFLAGS += -fopenmp -lesslsmp
   endif
-  COMPILERFLAGS += -mllvm --gemmfarer-replacement-mode=$(MODE)
+  COMPILERFLAGS += -mllvm --kernelfarer-replacement-mode=$(MODE)
 else
   LDFLAGS += -fopenmp
   # WARNING: Most polly flags are non-portable!

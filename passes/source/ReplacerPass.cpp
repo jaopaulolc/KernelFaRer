@@ -223,7 +223,7 @@ void buildBLASGEMMCall(Module &Mod, IRBuilder<> &IR,
 
   // Prepare argument list
   auto *I32 = IR.getInt32Ty();
-  auto *OpPtrTy = OpTy->getPointerTo();
+  auto *OpPtrTy = PointerType::get(OpTy, /*AddressSpace*/ 0);
   Type *ArgTys[] = {I32,     I32, I32,     I32, I32,  I32,     OpTy,
                     OpPtrTy, I32, OpPtrTy, I32, OpTy, OpPtrTy, I32};
   Value *Args[] = {Layout, TransA, TransB, M,   N,    K, Alpha,
@@ -259,7 +259,7 @@ void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
   auto *C = &MC.getBaseAddressPointer();
 
   // C's pointed to type defines the operation type.
-  Type *opTy = MC.getScalarElementType();
+  Type *OpTy = MC.getScalarElementType();
 
   // Make args for LDA, LDB, LDC
   auto *LDA = prepBLASInt32(IR, &MA.getLeadingDimensionSize(), Downcast);
@@ -272,26 +272,26 @@ void buildBLASSYR2KCall(Module &Mod, IRBuilder<> &IR, const Kernel &Syr2k) {
               " downcast.\nThis operation is potentially illegal.\n";
 
   // Make args for alpha/beta.
-  auto *Alpha = prepBLASScalar(IR, Syr2k.getAlpha(), opTy, AlphaInit);
-  auto *Beta = prepBLASScalar(IR, Syr2k.getBeta(), opTy, BetaInit);
+  auto *Alpha = prepBLASScalar(IR, Syr2k.getAlpha(), OpTy, AlphaInit);
+  auto *Beta = prepBLASScalar(IR, Syr2k.getBeta(), OpTy, BetaInit);
 
   // Sanity type checking.
-  assert(MA.getScalarElementType() == opTy && "A and C are typed differently.");
-  assert(MB.getScalarElementType() == opTy && "B and C are typed differently.");
-  assert(Alpha->getType() == opTy && "Alpha and C are typed differently.");
-  assert(Beta->getType() == opTy && "Beta and C are typed differently.");
+  assert(MA.getScalarElementType() == OpTy && "A and C are typed differently.");
+  assert(MB.getScalarElementType() == OpTy && "B and C are typed differently.");
+  assert(Alpha->getType() == OpTy && "Alpha and C are typed differently.");
+  assert(Beta->getType() == OpTy && "Beta and C are typed differently.");
 
   // Prepare argument list
   IntegerType *I32 = IR.getInt32Ty();
-  Type *opPtrTy = opTy->getPointerTo();
-  Type *ArgTys[] = {I32, I32,     I32, I32,  I32,     opTy, opPtrTy,
-                    I32, opPtrTy, I32, opTy, opPtrTy, I32};
+  auto *OpPtrTy = PointerType::get(OpTy, /*AddressSpace*/ 0);
+  Type *ArgTys[] = {I32, I32,     I32, I32,  I32,     OpTy, OpPtrTy,
+                    I32, OpPtrTy, I32, OpTy, OpPtrTy, I32};
   Value *Args[] = {Layout, Uplo, Trans, N,    K, Alpha, A,
                    LDA,    B,    LDB,   Beta, C, LDC};
 
   // Insert prepared call in the IR
   StringRef FunctionName =
-      (opTy == IR.getFloatTy()) ? "cblas_ssyr2k" : "cblas_dsyr2k";
+      (OpTy == IR.getFloatTy()) ? "cblas_ssyr2k" : "cblas_dsyr2k";
   insertNoInlineCall(Mod, IR, ArgTys, Args, FunctionName);
 }
 
@@ -342,7 +342,7 @@ void buildMMIntrinsicCall(IRBuilder<> &IR, const KernelFaRer::GEMM &Gemm) {
   auto IsBColMajor = MB.getLayout() == KernelFaRer::ColMajor;
   auto const &BAlign = Align(BElType->getPrimitiveSizeInBits() / BitsInAByte);
 
-  auto *PtrToMatrixElType = CElType->getPointerTo(/*AddressSpace*/ 0);
+  auto *PtrToMatrixElType = PointerType::get(CElType, /*AddressSpace*/0);
   auto &APtr = *IR.CreateBitCast(&A, PtrToMatrixElType);
   auto &BPtr = *IR.CreateBitCast(&B, PtrToMatrixElType);
   auto &CPtr = *IR.CreateBitCast(&C, PtrToMatrixElType);
@@ -413,7 +413,7 @@ void buildEigenCall(Module &Mod, IRBuilder<> &IR, const KernelFaRer::GEMM &Gemm)
   Args.emplace_back(B);
   Args.emplace_back(C);
   for (size_t I = 0; I < 3; ++I) {
-    ArgTys.emplace_back(OpTy->getPointerTo());
+    ArgTys.emplace_back(PointerType::get(OpTy, /*AddressSpace*/0));
   }
 
   // Make the function name

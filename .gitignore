@@ -1,3 +1,5 @@
 .cache/
 build/
 compile_commands.json
+lit-tests/.lit_test_times.txt
+lit-tests/Output

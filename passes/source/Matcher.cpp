@@ -27,7 +27,6 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PatternMatch.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include "KernelFaRer.h"
 
@@ -463,15 +462,15 @@ static bool matchLoopUpperBound(LoopInfo &LI, PHINode *IndVar, Value *&UBound) {
             return true;
           }
         if (auto *CMP = dyn_cast<ICmpInst>(BR->getCondition())) {
-          ICmpInst::Predicate Pred;
           // Iterate over header phis, find the one that matches the upper
           // bound
           for (BasicBlock::const_iterator I = Header->begin(); isa<PHINode>(I);
                I++) {
             const auto *PHI = static_cast<const Value *>(&*I);
+            CmpPredicate CmpPred;
             if (!match(CMP,
                        m_c_ICmp(
-                           Pred,
+                           CmpPred,
                            m_CombineOr(m_Specific(PHI),
                                        m_c_Add(m_Specific(PHI), m_Value())),
                            m_OneOf(m_ZExt(m_Value(UBound)),
